@@ -8,7 +8,7 @@
 // here as `SC_VERSION` (and the build date as `SC_BUILD_DATE`) at compile time.
 // That means every built binary self-reports exactly which version it is via
 // the UCI `id name` line — which is what makes automated version testing (see
-// tools/version.py and tools/match.py) able to tell builds apart.
+// the dev-side versioning and match tools) able to tell builds apart.
 //
 // The fallbacks below only apply when a translation unit is compiled without
 // the Makefile's -D flags (e.g. an ad-hoc single-file compile); a normal

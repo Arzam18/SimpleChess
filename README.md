@@ -18,14 +18,16 @@
 SimpleChess pairs a modern, heavily-tuned alpha-beta search with a from-scratch
 NNUE evaluation trained entirely on the engine's own self-play. Board representation
 and legal move generation come from a vendored, header-only move-generation
-library. The engine is tuned for Apple Silicon but builds and runs anywhere with
-a C++20 compiler.
+library. The engine has hand-tuned SIMD paths for both Apple Silicon (NEON) and
+x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
 
 ## Features
 
 - **Evaluation** — a custom NNUE: a HalfKAv2_hm input (king-bucketed and
   mirrored) extended with threat and pawn-pair features, a 512-wide accumulator,
-  and int8 SIMD inference (NEON on Apple Silicon).
+  and int8 SIMD inference (NEON on Apple Silicon, AVX2 on x86-64).
+- **Endgame tablebases** — Syzygy WDL probing (via Fathom): point `SyzygyPath` at
+  your 3-4-5 or 6-man tables.
 - **Search** — iterative-deepening alpha-beta with aspiration windows, null-move
   pruning, late-move reductions, SEE-based pruning, a transposition table,
   killer / history / continuation move ordering, and lazy-SMP multithreading.
@@ -51,7 +53,9 @@ make profile-build PGO_NET=nets/SCNNUEv3-2026-08-30.scn5
 ```
 
 The release build uses `-O3 -flto -mcpu=native`; retarget the architecture with,
-e.g., `make ARCH="-mcpu=apple-m2"` or `make ARCH="-march=x86-64-v3"`.
+e.g., `make ARCH="-mcpu=apple-m2"` or `make ARCH="-march=x86-64-v3"`. On x86-64 hosts
+the Makefile (and CMake) select `-march=native` automatically; for a binary that runs on
+any AVX2 machine (Haswell or newer) use `make ARCH="-march=x86-64-v3"`.
 `profile-build` additionally needs Python 3 with
 [python-chess](https://pypi.org/project/chess/) (`pip install chess`) for its
 training workload. A `CMakeLists.txt` is provided for IDE / CMake users.
@@ -86,6 +90,10 @@ Point the `EvalFile` option at another file to use a different network.
 | `Book File` | *(none)* | path to a Polyglot book, if you supply one |
 | `EvalFile` | *(newest `SCNNUEv3-<date>.scn5`)* | network file to load |
 | `RootNoise` | 0 | root-move score jitter (cp) for varied play |
+| `SyzygyPath` | *(none)* | directory of Syzygy WDL tables (`*.rtbw`); probing is off until set |
+| `SyzygyProbeDepth` | 1 | minimum remaining depth for an interior probe |
+| `SyzygyProbeLimit` | 7 | probe only with this many pieces or fewer |
+| `Syzygy50MoveRule` | true | treat cursed wins / blessed losses as draws |
 
 ## The network
 

@@ -82,6 +82,14 @@ struct History {
         return cont->v[prev_piece][prev_to][piece][to];
     }
 
+    // E6: one continuation-history row (indexed [piece][to]) for a previous move, or
+    // nullptr for the "no previous move" sentinel. Lets callers that score many
+    // candidates resolve cont->v[prev_piece][prev_to] once instead of per move.
+    using ContRow = const std::int16_t (*)[64];
+    [[nodiscard]] ContRow cont_row(int prev_piece, int prev_to) const noexcept {
+        return prev_piece < 12 ? cont->v[prev_piece][prev_to] : nullptr;
+    }
+
     // Combined quiet score used for ordering and LMR adjustment: butterfly plus
     // the continuation entries for 1 and 2 plies back (sentinel-safe).
     [[nodiscard]] int quiet_score(int stm, int from, int to, int piece, int prev1_piece,

@@ -8,10 +8,7 @@
 #   make run        # build, then launch the engine (UCI on stdin)
 #   make clean      # remove build artifacts
 #   make version    # print the current version string
-#   make save NAME=v0.2 MSG="..."   # archive this build (see tools/version.py)
-#   make promote NAME=v0.2          # v0.2 becomes ./simplechess (see tools/version.py)
-#   make restore NAME=v0.2          # v0.2's archived source overwrites the working tree
-#   make versions   # list archived versions
+#   make save/promote/restore/versions   # version-archive wrappers (dev tree only)
 #
 # Override the compiler or flags from the command line, e.g.:
 #   make CXX=g++-14
@@ -26,6 +23,11 @@ SRC_DIR   := src
 # stale objects built with the other configuration's flags.
 BUILD_DIR ?= build
 LIB_INC   := external/chess-library/include
+
+# Vendored Fathom (Syzygy probing): header-only from the build's view — src/syzygy.cpp
+# is the single TU that #includes tbprobe.c (which pulls in tbchess.c). We only add
+# its include path here. See external/Fathom/src/LICENSE (MIT).
+FATHOM_INC := external/Fathom/src
 
 SOURCES := $(wildcard $(SRC_DIR)/*.cpp)
 OBJECTS := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
@@ -53,15 +55,19 @@ VERSION_DEFS := -DSC_VERSION='"$(VERSION)"' -DSC_VERSION_FS='"$(VERSION_FS)"' \
                 -DSC_BUILD_DATE='"$(BUILD_DATE)"'
 
 # Apple Silicon: -mcpu=native lets clang target this exact core (M1/M2/M3/M4).
-ARCH     ?= -mcpu=native
+# On x86 clang, -mcpu= is only an -mtune alias (no ISA level!), so a bare `make`
+# there would silently emit an SSE2 binary; pick -march=native on x86 hosts.
+ARCH     ?= $(if $(filter x86_64 amd64,$(shell uname -m)),-march=native,-mcpu=native)
 
 STD       := -std=c++20
 # -Wshadow is intentionally omitted: the vendored chess-library header trips it.
 WARN      := -Wall -Wextra
-INCLUDES  := -I$(SRC_DIR) -I$(LIB_INC)
+INCLUDES  := -I$(SRC_DIR) -I$(LIB_INC) -I$(FATHOM_INC)
 
 # EXTRA hooks in ad-hoc defines without replacing the whole flag set, e.g.
 #   make EXTRA="-DSC_KATT_SCALE=50" BUILD_DIR=... EXE=...   (weight experiments)
+# EXTRA also survives profile-build: the PGO phases append their flags to it,
+# so `make profile-build EXTRA="-DSC_X=1" ...` really compiles with SC_X=1.
 EXTRA     ?=
 CXXFLAGS  ?= $(STD) -O3 -DNDEBUG -flto $(ARCH) -funroll-loops $(WARN) $(INCLUDES) $(EXTRA)
 LDFLAGS   ?= -flto -pthread
@@ -105,8 +111,16 @@ LLVM_PROFDATA ?= $(shell xcrun --find llvm-profdata 2>/dev/null || echo llvm-pro
 # the profile we just merged.
 PGO_DIR       ?= $(BUILD_DIR)-pgo
 PGO_NET       ?=
-PGO_WORKLOAD  ?= tools/pgo_workload.py
-PGO_ABS       := $(abspath $(PGO_DIR))
+# The workload may sit in tools/ or tools/speed/; take whichever exists.
+PGO_WORKLOAD  ?= $(firstword $(wildcard tools/speed/pgo_workload.py tools/pgo_workload.py) tools/pgo_workload.py)
+PGO_DEPTH     ?=
+PGO_FENS      ?=
+# The workload needs python-chess; override when `python3` on PATH lacks it
+# (e.g. MSYS2's own python): make profile-build PYTHON=/path/to/python.exe ...
+PYTHON        ?= python3
+# Native (non-MSYS) clang/llvm-profdata need a Windows-style path for the
+# profile dir; inside an MSYS2 shell $(MSYSTEM) is set, so convert there.
+PGO_ABS       := $(if $(MSYSTEM),$(shell cygpath -m $(abspath $(PGO_DIR))),$(abspath $(PGO_DIR)))
 
 profile-build:
 	@test -n "$(PGO_NET)" || { echo "ERROR: profile-build needs PGO_NET=path/to/net"; exit 1; }
@@ -114,36 +128,38 @@ profile-build:
 	@mkdir -p $(PGO_DIR)
 	@echo ">> PGO 1/3: instrumented build (-fprofile-generate)"
 	@$(MAKE) SRC_DIR=$(SRC_DIR) BUILD_DIR=$(BUILD_DIR) EXE=$(EXE) \
-	         EXTRA="-fprofile-generate=$(PGO_ABS)" \
+	         EXTRA="$(EXTRA) -fprofile-generate=$(PGO_ABS)" \
 	         LDFLAGS="$(LDFLAGS) -fprofile-generate=$(PGO_ABS)" all
 	@echo ">> PGO 2/3: training workload"
-	@LLVM_PROFILE_FILE="$(PGO_ABS)/prof-%p-%m.profraw" \
-	   python3 $(PGO_WORKLOAD) ./$(EXE) $(PGO_NET)
+	@LLVM_PROFILE_FILE="$(PGO_ABS)/prof-%p-%m.profraw" PGO_DEPTH="$(PGO_DEPTH)" PGO_FENS="$(PGO_FENS)" \
+	   $(PYTHON) $(PGO_WORKLOAD) ./$(EXE) $(PGO_NET)
 	@$(LLVM_PROFDATA) merge -output=$(PGO_ABS)/prof.profdata $(PGO_ABS)/*.profraw
 	@echo ">> PGO 3/3: rebuild (-fprofile-use)"
 	@rm -rf $(BUILD_DIR) $(EXE)
 	@$(MAKE) SRC_DIR=$(SRC_DIR) BUILD_DIR=$(BUILD_DIR) EXE=$(EXE) \
-	         EXTRA="-fprofile-use=$(PGO_ABS)/prof.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled" \
+	         EXTRA="$(EXTRA) -fprofile-use=$(PGO_ABS)/prof.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled" \
 	         LDFLAGS="$(LDFLAGS) -fprofile-use=$(PGO_ABS)/prof.profdata" all
 	@echo ">> PGO build complete: ./$(EXE)"
 
-# ---- Versioning convenience wrappers (see tools/version.py) ------------------
+# ---- Versioning convenience wrappers (dev tree only: need tools/release/version.py) ----
+ifneq ($(wildcard tools/release/version.py),)
 version:
 	@echo "Simple Chess $(VERSION)"
 
 save:
-	@python3 tools/version.py save $(NAME) $(if $(MSG),-m "$(MSG)",)
+	@python3 tools/release/version.py save $(NAME) $(if $(MSG),-m "$(MSG)",)
 
 promote:
-	@python3 tools/version.py promote $(NAME)
+	@python3 tools/release/version.py promote $(NAME)
 
 restore:
-	@python3 tools/version.py restore $(NAME)
+	@python3 tools/release/version.py restore $(NAME)
 
 versions:
-	@python3 tools/version.py list
+	@python3 tools/release/version.py list
 
 clean:
 	@rm -rf build build-debug simplechess simplechess-debug
 
 -include $(DEPS)
+endif

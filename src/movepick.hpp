@@ -48,14 +48,21 @@ class MovePicker {
     // this is the combined history score, which LMR uses to tune reductions.
     [[nodiscard]] int last_score() const noexcept { return last_score_; }
 
+    // SEE verdict at threshold 0 for the move most recently returned by next():
+    // +1 = see_ge(m, 0) held, -1 = it failed, 0 = not evaluated (TT move, promotions,
+    // quiets). Lets the search reuse the classification instead of re-running SEE.
+    [[nodiscard]] int last_see() const noexcept { return last_see_; }
+
    private:
     void score(const History& hist, const OrderingContext& ctx);
 
     const Board& board_;
     Movelist     moves_;
     int          scores_[MAX_MOVES];
+    std::int8_t  see_[MAX_MOVES];   // per-move SEE verdict at threshold 0 (+1 / -1 / 0 unknown), see last_see()
     int          cur_        = 0;
     int          last_score_ = 0;
+    int          last_see_   = 0;
 };
 
 }  // namespace engine

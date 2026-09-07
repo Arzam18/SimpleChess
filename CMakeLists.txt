@@ -38,12 +38,20 @@ target_compile_definitions(simplechess PRIVATE
 target_include_directories(simplechess PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
     "${CMAKE_SOURCE_DIR}/external/chess-library/include"
+    "${CMAKE_SOURCE_DIR}/external/Fathom/src"   # src/syzygy.cpp #includes tbprobe.c
 )
 
-# Release tuning. -mcpu=native targets the host Apple Silicon core.
+# Release tuning. Pick the host-appropriate "native" flag: x86 uses -march=native
+# (-mcpu is tune-only there and would silently produce a baseline SSE2 binary),
+# ARM/Apple-silicon uses -mcpu=native.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
+    set(SC_NATIVE_ARCH -march=native)
+else()
+    set(SC_NATIVE_ARCH -mcpu=native)
+endif()
 target_compile_options(simplechess PRIVATE
     $<$<CONFIG:Release>:-O3 -DNDEBUG -funroll-loops>
-    $<$<CONFIG:Release>:-mcpu=native>
+    $<$<CONFIG:Release>:${SC_NATIVE_ARCH}>
     -Wall -Wextra
 )
 

@@ -7,21 +7,39 @@ the profiler sees representative search + NNUE-eval + accumulator code paths. Th
 build's -fprofile-generate=<dir> (and/or the LLVM_PROFILE_FILE env the Makefile
 sets) decides where the .profraw lands; this script just does the work.
 
-  LLVM_PROFILE_FILE=.../prof-%p-%m.profraw python3 tools/pgo_workload.py <engine> <net> [depth]
+  LLVM_PROFILE_FILE=.../prof-%p-%m.profraw python3 <path-to>/pgo_workload.py <engine> <net> [depth]
 
 <net> must match the engine's expected format (threats engine -> SCN4 float / SCN5 int8).
 Weights are irrelevant to profiling (only the executed code paths matter), so a
 throwaway correctly-shaped net is fine when no trained net exists yet.
 """
-import sys, time
+import sys, time, os, shutil, tempfile
 import chess, chess.engine
 
 engine_path = sys.argv[1]
 net = sys.argv[2]
-depth = int(sys.argv[3]) if len(sys.argv) > 3 else 11
+# depth: env PGO_DEPTH wins, then argv[3], else 11 (unset -> unchanged default).
+depth = int(os.environ.get("PGO_DEPTH") or (sys.argv[3] if len(sys.argv) > 3 else 11))
+
+# Deterministic profile: the engine's startup net discovery iterates exe_dir and
+# cwd (src/uci.cpp try_load_default_net), so its branch counts -- and therefore the
+# PGO layout -- change whenever the repo root gains a file (measured: two builds of
+# identical source differed in 15 cold functions and 928 bytes of .text). Run the
+# instrumented engine from a private sandbox holding ONLY a copy of the exe and
+# nets/<net>, so every profile sees the same directory contents.
+# PGO_NO_SANDBOX=1 restores running in place.
+SANDBOX = None
+if not os.environ.get("PGO_NO_SANDBOX"):
+    SANDBOX = tempfile.mkdtemp(prefix="pgo-sandbox-")
+    sb_exe = os.path.join(SANDBOX, os.path.basename(engine_path))
+    shutil.copy2(engine_path, sb_exe)
+    os.makedirs(os.path.join(SANDBOX, "nets"))
+    sb_net = os.path.join(SANDBOX, "nets", os.path.basename(net))
+    shutil.copy2(net, sb_net)
+    engine_path, net = sb_exe, sb_net
 
 # Opening / kiwipete / quiet middlegame / R+P endgame / heavy-piece / tactical.
-FENS = [
+_DEFAULT_FENS = [
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
     "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P4/2NBPN2/PPP2PPP/R1BQ1RK1 w - - 0 1",
@@ -29,11 +47,21 @@ FENS = [
     "2r3k1/1p3pp1/p2p3p/4n3/1PP1P3/P2r1PP1/3R2KP/3R4 b - - 0 1",
     "r2q1rk1/1b1nbppp/p2ppn2/1p6/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 0 1",
 ]
+# env PGO_FENS = path to a JSON list of FENs (a JSON list of FEN strings); unset -> the 6 above.
+import json as _json
+_fens_file = os.environ.get("PGO_FENS")
+FENS = _json.load(open(_fens_file, encoding="utf-8")) if _fens_file else _DEFAULT_FENS
 
 import os
 
 def run_pass(net_path, tag, d):
-    eng = chess.engine.SimpleEngine.popen_uci(engine_path)
+    if SANDBOX and os.path.dirname(os.path.abspath(net_path)) != os.path.join(SANDBOX, "nets"):
+        # a net discovered outside the sandbox (the float pass): bring it in too
+        dst = os.path.join(SANDBOX, "nets", os.path.basename(net_path))
+        shutil.copy2(net_path, dst)
+        net_path = dst
+    popen_kw = {"cwd": SANDBOX} if SANDBOX else {}
+    eng = chess.engine.SimpleEngine.popen_uci(engine_path, **popen_kw)
     eng.configure({"OwnBook": False, "Threads": 1, "EvalFile": net_path})
     total = 0
     t0 = time.perf_counter()
@@ -65,3 +93,6 @@ if float_net and os.path.exists(float_net):
 else:
     print("pgo_workload: no .scn4 float net found -> eval_float NOT profiled "
           "(set PGO_FLOAT or place a .scn4 in data/) — float/self-play path will be slow")
+
+if SANDBOX:
+    shutil.rmtree(SANDBOX, ignore_errors=True)  # the .profraw went to LLVM_PROFILE_FILE, not here

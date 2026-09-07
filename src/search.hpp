@@ -32,13 +32,15 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <condition_variable>
+#include <mutex>
 
 #include "history.hpp"
 #include "timeman.hpp"
 #include "tt.hpp"
 
 // Build-time overridable UCI defaults. The native build keeps the originals; the
-// Windows/CCRL cross-build (tools/build_windows.sh) sets Hash 256 / Threads 1.
+// The Windows/CCRL release build sets Hash 256 / Threads 1 via these defines.
 // SC_DEFAULT_HASH is in MB.
 #ifndef SC_DEFAULT_HASH
 #define SC_DEFAULT_HASH 4096
@@ -193,6 +195,20 @@ class Search {
 
     std::vector<std::unique_ptr<Worker>> workers_;
     std::vector<std::thread>             threads_;
+    // F1: threads_ holds a PERSISTENT pool (spawned in set_threads, joined on shutdown)
+    // instead of per-go threads. start() signals the pool; wait() blocks on completion.
+    // Avoids creating threads and first-touching each worker's ~1 MB thread_local
+    // accumulator stack on every `go`. Search results are unchanged (acc_reset +
+    // new_search re-initialise all per-search state at the root), so it is bit-identical.
+    std::mutex               pool_mu_;
+    std::condition_variable  pool_start_cv_;
+    std::condition_variable  pool_done_cv_;
+    std::vector<char>        pool_go_;        // per-worker start flag (char, not vector<bool>)
+    int                      pool_active_ = 0;// workers still in think()
+    bool                     pool_quit_   = false;
+    void pool_loop(int id);
+    void pool_spawn();
+    void pool_shutdown() noexcept;
 
     std::atomic<bool> stop_{true};        // true == search should unwind now
     std::atomic<bool> searching_{false};  // true between start() and bestmove

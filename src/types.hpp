@@ -65,6 +65,15 @@ constexpr int MAX_PLY   = 246;
 // Upper bound on legal moves in any position (library uses 256 internally).
 constexpr int MAX_MOVES = 256;
 
+// Endgame-tablebase win/loss band, just below the mate band. A Syzygy verdict
+// outranks any normal centipawn eval but loses to a proven mate, and is
+// deliberately kept BELOW VALUE_MATE_IN_MAX_PLY so is_mate_score() does not treat
+// it as a mate (mate-distance logic must ignore TB scores). Encoded with ply like
+// mate scores so a nearer conversion is preferred over a farther one.
+constexpr Value VALUE_TB                  = VALUE_MATE_IN_MAX_PLY - 1;   // 29999
+constexpr Value VALUE_TB_WIN_IN_MAX_PLY   = VALUE_TB - MAX_PLY;          // ~29753
+constexpr Value VALUE_TB_LOSS_IN_MAX_PLY  = -VALUE_TB_WIN_IN_MAX_PLY;
+
 // Convenience: is `v` a mate-or-mated score (as opposed to a normal eval)?
 [[nodiscard]] constexpr bool is_mate_score(Value v) noexcept {
     return v >= VALUE_MATE_IN_MAX_PLY || v <= VALUE_MATED_IN_MAX_PLY;

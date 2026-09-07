@@ -1,26 +1,25 @@
 // -----------------------------------------------------------------------------
-// nnue.cpp — EXPERIMENTAL Stockfish-style threats inference (engine FORK).
-//
-// This is the src-threats/ fork. The stock engine (src/nnue.cpp) is untouched;
-// revert by building from src/ instead of src-threats/.
+// nnue.cpp — NNUE inference: threat-augmented HalfKA network, int8 SIMD play path.
 //
 // Architecture (matches train_bullet/src/train_threats.rs + threat_inputs.rs):
 //   inputs = [ king-bucketed mirrored HalfKA-768 base (768*buckets)
-//            | Stockfish FullThreats (59808, exact)
-//            | Stockfish PP_3Wide    (4560,  exact) ]
+//            | FullThreats threat features (59808)
+//            | PP_3Wide pawn-pair features  (4560) ]
 //   FT 512, crelu + pairwise-multiply; 8 material output buckets; body 512->L2->32->1.
 //
-// The FullThreats/PP_3Wide index math is a faithful port of Stockfish's
-// src/nnue/features/{full_threats,pp_3wide}.cpp, and is byte-identical to the
-// Rust trainer's threat_inputs.rs (validated by train_bullet's check_threats).
-// Correctness-first: a single float full-recompute per eval (no incremental
-// accumulator, no quantisation yet).
+// The threat / pawn-pair feature indexing here is byte-identical to the Rust
+// trainer's threat_inputs.rs (validated by train_bullet's check_threats), so a
+// net trained there evaluates identically here.
 //
-// Loads a self-describing "SCN4" float net (train_threats exporter):
+// Two paths: the float path (SCN4 nets, used for self-play labelling) and the
+// quantised int8 SIMD path (SCN5 nets, the playing format), both driven by the
+// incremental accumulator maintained around make/unmake.
+//
+// SCN4 float net (train_threats exporter):
 //   "SCN4", u32{version=4, hl, input_buckets, l2, out_buckets},
 //   then u32 len + f32[len] for each of l0w l0b l1w l1b l2w l2b l3w l3b.
 //   total_inputs is derived as 768*input_buckets + 59808 + 4560.
-//   (SCN4 float -> SCN5 int8 playing net via tools/quantize_threats.py.)
+//   (SCN4 float -> SCN5 int8 playing net via the net quantiser in the dev tooling.)
 // -----------------------------------------------------------------------------
 
 #include "nnue.hpp"
@@ -33,23 +32,82 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <new>
 #include <vector>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
+#if defined(__AVX2__)
+#include <immintrin.h>   // x86 AVX2 kernels (Haswell+; the CCRL ship target)
+#endif
+
+#if defined(_WIN32)
+// D2: back the ~35 MB feature-transformer weights (l0w_i8) with 2 MB large pages to cut
+// TLB misses on the scattered 512 B feature-row gathers. Only allocations >= 2 MB take
+// this path, so the small L1/L2/L3 weight vectors keep operator new. A tiny registry
+// records which pointers are large-page-backed so deallocate() frees them correctly.
+// The stored weights are byte-identical either way -> bit-identical.
+#include <mutex>
+#include <unordered_set>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+namespace {
+constexpr std::size_t kLargePageThresh = 2u * 1024u * 1024u;
+std::mutex             g_lp_mu;
+std::unordered_set<void*>& g_lp_set() { static std::unordered_set<void*> s; return s; }
+bool sc_enable_lock_pages_nnue() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
+        return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount           = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    bool ok = LookupPrivilegeValue(nullptr, SE_LOCK_MEMORY_NAME, &tp.Privileges[0].Luid) &&
+              AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) &&
+              GetLastError() == ERROR_SUCCESS;
+    CloseHandle(tok);
+    return ok;
+}
+void* sc_nnue_large_alloc(std::size_t bytes) {
+    static const bool priv = sc_enable_lock_pages_nnue();
+    if (!priv) return nullptr;
+    const std::size_t gran = GetLargePageMinimum();
+    if (gran == 0) return nullptr;
+    const std::size_t rounded = ((bytes + gran - 1) / gran) * gran;
+    void* p = VirtualAlloc(nullptr, rounded, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                           PAGE_READWRITE);
+    if (p) { std::lock_guard<std::mutex> lk(g_lp_mu); g_lp_set().insert(p); }
+    return p;
+}
+bool sc_nnue_large_free(void* p) {
+    std::lock_guard<std::mutex> lk(g_lp_mu);
+    auto& s = g_lp_set();
+    auto it = s.find(p);
+    if (it == s.end()) return false;
+    s.erase(it);
+    VirtualFree(p, 0, MEM_RELEASE);
+    return true;
+}
+}  // namespace
 #endif
 
 namespace engine::nnue {
 
 namespace {
 
-// ---- Stockfish feature-set constants (verbatim) -----------------------------
-constexpr int THREAT_DIMS = 59808;   // FullThreats::Dimensions
-constexpr int PP_PAWN_IDS = 2 * 48;  // COLOR_NB * 48
+// ---- Threat feature-set constants ------------------------------------------
+constexpr int THREAT_DIMS = 59808;   // FullThreats feature count
+constexpr int PP_PAWN_IDS = 2 * 48;  // colours * 48 pawn squares
 constexpr int PP_DIMS = PP_PAWN_IDS * (PP_PAWN_IDS - 1) / 2;  // 4560
 constexpr int PP_INDEX_BASE = THREAT_DIMS;
 
-// SF piece encoding: color bit = 8, type = piece & 7 in 1..6.
+// Piece code used by the threat index math: color bit = 8, type = code & 7 in 1..6.
 constexpr int SF_W_PAWN = 1;
 constexpr int SF_B_PAWN = 9;
 
@@ -126,7 +184,7 @@ std::uint64_t pawn_attacks(int color, int sq) {  // 0 = white (north), 1 = black
     }
     return bb;
 }
-std::uint64_t pseudo_attacks_type(int pt, int sq) {  // SF type 2..6
+std::uint64_t pseudo_attacks_type(int pt, int sq) {  // piece type 2..6 = N,B,R,Q,K
     switch (pt) {
         case 2: return knight_attacks(sq);
         case 3: return ray_attacks(sq, 0, BISHOP_DIRS, 4);
@@ -155,7 +213,7 @@ std::uint64_t pseudo_for_index(int sf_piece, int sq) {
 }
 inline int popcount64(std::uint64_t x) { return __builtin_popcountll(x); }
 
-// ---- precomputed Stockfish LUTs (built once at load) ------------------------
+// ---- precomputed threat-index lookup tables (built once at load) ------------
 struct Tables {
     std::array<std::array<std::uint32_t, 64>, 16> offsets{};
     std::array<std::array<std::array<std::uint32_t, 2>, 16>, 16> lut1{};
@@ -236,14 +294,15 @@ inline std::uint32_t make_threat_index(int attacker, int from, int to, int attac
 }
 
 // ---- net --------------------------------------------------------------------
-// Quantisation scales (must match tools/quantize_threats.py and the trainer's
+// Quantisation scales (must match the net quantiser and the trainer's
 // save scheme): feature transformer x QA (int8 weights), L1 x QB (int8). The
 // int16 accumulator holds sums of int8 weights (activation scale 127).
 constexpr int QA = 127;
 constexpr int QB = 64;
 
 // Stack-buffer caps for the quant path (no per-eval heap allocation).
-constexpr int MAX_HL = 1024;
+constexpr int MAX_HL = 512;    // tight accumulator slots (2 KB, not 4 KB) for a 32 KB L1d; x86 campaign A10.
+                               // load() rejects nets with hl > MAX_HL, so this is a hard cap, not a hint.
 constexpr int MAX_L2 = 64;
 // Fixed-point scale for the float labeler's incremental accumulator. Integer add is
 // associative, so incremental == from-scratch bit-exactly; S is large enough that the
@@ -252,15 +311,47 @@ constexpr int MAX_L2 = 64;
 constexpr int    FX_SHIFT = 22;
 constexpr double FX_S     = double(1u << FX_SHIFT);
 
+// 64-byte-aligned storage for the hot weight tensors (x86 campaign G3): std::vector only
+// guarantees 16 B, so a 512 B FT row could straddle 9 cache lines instead of 8 and every
+// AVX2 row load is unaligned. Same bytes, same indexing -- only the address changes.
+template <class T> struct Align64Alloc {
+    using value_type = T;
+    Align64Alloc() = default;
+    template <class U> Align64Alloc(const Align64Alloc<U>&) noexcept {}
+    T* allocate(std::size_t n) {
+#if defined(_WIN32)
+        if (n * sizeof(T) >= kLargePageThresh) {
+            if (void* p = sc_nnue_large_alloc(n * sizeof(T))) return static_cast<T*>(p);
+        }
+#endif
+        return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t{64}));
+    }
+    void deallocate(T* p, std::size_t) noexcept {
+#if defined(_WIN32)
+        if (sc_nnue_large_free(p)) return;
+#endif
+        ::operator delete(p, std::align_val_t{64});
+    }
+    template <class U> bool operator==(const Align64Alloc<U>&) const noexcept { return true; }
+    template <class U> bool operator!=(const Align64Alloc<U>&) const noexcept { return false; }
+};
+#if defined(__ARM_NEON)
+template <class T> using WVec = std::vector<T>;                    // pre-G3: default (16-B) alignment
+#else
+template <class T> using WVec = std::vector<T, Align64Alloc<T>>;   // x86 campaign G3: +1.06% (all phases)
+#endif
+
 struct Net {
     bool loaded = false;
     bool quant = false;  // false = SCN4 float, true = SCN5 quantised (int8 FT)
     int hl = 0, input_buckets = 0, l2 = 0, out_buckets = 0;
     std::size_t base_dims = 0, total_inputs = 0;
-    std::vector<float> l0w, l0b, l1w, l1b, l2w, l2b, l3w, l3b;
+    std::vector<float> l0w, l0b, l1w, l1b, l2b, l3w, l3b;
+    WVec<float> l2w;               // 64-B aligned (G3): finish_body reads 32-float rows
+    WVec<float> l2w_bm;            // G2: bucket-major [(b*L2 + i)*32 + o] -- 4 KB contiguous per bucket
     // quant path: int8 feature transformer + int8 L1 (body stays float);
     // int16 accumulator + int16 FT bias.
-    std::vector<std::int8_t> l0w_i8;
+    WVec<std::int8_t> l0w_i8;      // 64-B aligned (G3): 512 B feature rows
     std::vector<std::int16_t> l0b_i;
     // float labeler path: fixed-point FT weights/bias (lround(w*FX_S)) for the
     // incremental int32 accumulator. Built at load for float (SCN4) nets.
@@ -268,7 +359,8 @@ struct Net {
     std::vector<std::int8_t> l1w_i;
     // L1 weights transposed to [bucket*L2 + o][HL] (HL contiguous) for the sdot
     // dot-product path; built from l1w_i on load.
-    std::vector<std::int8_t> l1w_dot;
+    WVec<std::int8_t> l1w_dot;     // 64-B aligned (G3): 512 B rows per output
+    std::vector<float> l3w_t;      // A6: [b*32 + i] = l3w[i*OB + b] -- contiguous per output bucket
     // int8 body: L2 weights as [bucket*32 + o][L2] (input contiguous) and L3 as
     // [bucket*32 + i]; per-layer global scale. Built from l2w/l3w on load (quant net).
     std::vector<std::int8_t> l2w_dot, l3w_dot;
@@ -289,12 +381,14 @@ bool g_i8body = false;     // SCNNUE_I8BODY=1: opt into the (lossy, post-hoc) in
                            // the bit-identical float body. Post-hoc int8 flips bestmoves (~3cp noise)
                            // for only ~3% nps; a real int8 body needs quantization-aware retrain (4.4).
 
-bool read_arr(std::ifstream& f, std::vector<float>& dst, std::uint32_t expect) {
+template <class Vec>   // std::vector<float> or the 64-B-aligned WVec<float> (G3)
+bool read_arr(std::ifstream& f, Vec& dst, std::uint32_t expect) {
     std::uint32_t n = 0;
     f.read(reinterpret_cast<char*>(&n), 4);
     if (!f || n != expect) return false;
     dst.resize(n);
-    f.read(reinterpret_cast<char*>(dst.data()), static_cast<std::streamsize>(n) * 4);
+    f.read(reinterpret_cast<char*>(dst.data()),
+           static_cast<std::streamsize>(n) * static_cast<std::streamsize>(sizeof(typename Vec::value_type)));
     return static_cast<bool>(f);
 }
 bool read_i16(std::ifstream& f, std::vector<std::int16_t>& dst, std::uint32_t expect) {
@@ -305,7 +399,8 @@ bool read_i16(std::ifstream& f, std::vector<std::int16_t>& dst, std::uint32_t ex
     f.read(reinterpret_cast<char*>(dst.data()), static_cast<std::streamsize>(n) * 2);
     return static_cast<bool>(f);
 }
-bool read_i8(std::ifstream& f, std::vector<std::int8_t>& dst, std::uint32_t expect) {
+template <class Vec>   // std::vector<int8_t> or the 64-B-aligned WVec<int8_t> (G3)
+bool read_i8(std::ifstream& f, Vec& dst, std::uint32_t expect) {
     std::uint32_t n = 0;
     f.read(reinterpret_cast<char*>(&n), 4);
     if (!f || n != expect) return false;
@@ -314,7 +409,7 @@ bool read_i8(std::ifstream& f, std::vector<std::int8_t>& dst, std::uint32_t expe
     return static_cast<bool>(f);
 }
 
-inline float crelu(float x) { return std::clamp(x, 0.0f, 1.0f); }
+[[maybe_unused]] inline float crelu(float x) { return std::clamp(x, 0.0f, 1.0f); }
 inline float screlu(float x) {
     const float c = std::clamp(x, 0.0f, 1.0f);
     return c * c;
@@ -344,6 +439,7 @@ bool load(const std::string& path) {
     n.input_buckets = int(hdr[2]);
     n.l2 = int(hdr[3]);
     n.out_buckets = int(hdr[4]);
+    if (n.hl > MAX_HL || n.l2 > MAX_L2) return false;   // the eval's stack buffers are sized by these caps
     const std::uint32_t HL = hdr[1], IB = hdr[2], L2 = hdr[3], OB = hdr[4];
     n.base_dims = 768ull * IB;
     n.total_inputs = n.base_dims + THREAT_DIMS + PP_DIMS;
@@ -411,6 +507,20 @@ bool load(const std::string& path) {
         std::vector<float>().swap(n.l0b);
     }
 
+    // L3 weights transposed to [bucket][32] so finish_body reads a contiguous row instead of a
+    // stride-OB gather (both net formats; the sequential fma chain is unchanged). x86 campaign A6.
+    n.l3w_t.resize(static_cast<std::size_t>(OB) * 32);
+    for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
+        for (std::uint32_t i = 0; i < 32; ++i)
+            n.l3w_t[static_cast<std::size_t>(bkt) * 32 + i] = n.l3w[static_cast<std::size_t>(i) * OB + bkt];
+    // L2 weights bucket-major [(b*L2 + i)*32 + o] so the AVX2 matvec walks 4 KB contiguous
+    // per bucket instead of 32 rows at a 1 KB stride (same fma per lane, same i order). x86 campaign G2.
+    n.l2w_bm.resize(static_cast<std::size_t>(OB) * L2 * 32);
+    for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
+        for (std::uint32_t i = 0; i < L2; ++i)
+            for (std::uint32_t o = 0; o < 32; ++o)
+                n.l2w_bm[(static_cast<std::size_t>(bkt) * L2 + i) * 32 + o] =
+                    n.l2w[static_cast<std::size_t>(i) * (OB * 32) + bkt * 32 + o];
     build_tables();
     g_base_only = std::getenv("SCNNUE_BASEONLY") != nullptr;
     g_no_accum = std::getenv("SCNNUE_NOACCUM") != nullptr;
@@ -624,7 +734,7 @@ inline void acc_add(std::int16_t* a, const std::int8_t* w, int hl) {
     for (int j = 0; j < hl; ++j) a[j] += w[j];
 #endif
 }
-inline void acc_sub(std::int16_t* a, const std::int8_t* w, int hl) {
+[[maybe_unused]] inline void acc_sub(std::int16_t* a, const std::int8_t* w, int hl) {
 #if defined(__ARM_NEON)
     for (int j = 0; j < hl; j += 16) {
         const int8x16_t wv = vld1q_s8(w + j);
@@ -636,19 +746,29 @@ inline void acc_sub(std::int16_t* a, const std::int8_t* w, int hl) {
 #endif
 }
 
+// Defined with the other fused kernels below; the refresh uses it for its one-pass form.
+inline void fused_apply_src(std::int16_t* dst, const std::int16_t* src, const std::int8_t* const* add, int na,
+                            const std::int8_t* const* sub, int ns, int hl);
+
 // Full refresh (base + threats + pp) for a position, both perspectives. Uses
 // gather routed to the absolute WHITE/BLACK-perspective accumulators.
 void refresh_into(Acc& a, const Board& board) {
     const Net& n = g_net;
     const int hl = n.hl;
     const std::int8_t* l0 = n.l0w_i8.data();
-    for (int p = 0; p < 2; ++p)
-        for (int j = 0; j < hl; ++j) a.v[p][j] = n.l0b_i[j];
     const int stmp = (board.sideToMove() == Color::WHITE) ? 0 : 1;
+    // Collect every active feature column, then ONE src->dst fused pass per perspective
+    // straight from the bias vector -- instead of a bias seed loop plus a 1 KB accumulator
+    // read+write per feature. int16 sums are order-independent -> bit-identical.
+    // (x86 campaign G1: +1.76%, all phases.)
+    static thread_local const std::int8_t* cols[2][1024];
+    int nc[2] = {0, 0};
     gather(
         board, n.base_dims,
-        [&](std::size_t f) { acc_add(a.v[stmp], l0 + f * hl, hl); },
-        [&](std::size_t f) { acc_add(a.v[1 - stmp], l0 + f * hl, hl); });
+        [&](std::size_t f) { cols[stmp][nc[stmp]++] = l0 + f * hl; },
+        [&](std::size_t f) { cols[1 - stmp][nc[1 - stmp]++] = l0 + f * hl; });
+    for (int p = 0; p < 2; ++p)
+        fused_apply_src(a.v[p], n.l0b_i.data(), cols[p], nc[p], nullptr, 0, hl);
 }
 
 // Fixed-point (int32) full refresh for the float labeler path: seed from l0b_fx, then
@@ -667,7 +787,7 @@ void refresh_into_fx(AccFx& a, const Board& board) {
 }
 
 // ---- incremental THREAT delta helpers ---------------------------------------
-// Absolute board state in SF piece indexing (sf = color<<3 | (type+1)); by[sf],
+// Absolute board state in threat-index piece coding (sf = color<<3 | (type+1)); by[sf],
 // occupancy, per-square piece, and king squares. Built from a chess::Board and
 // mutated in place to form the after-move state.
 struct BB {
@@ -825,9 +945,297 @@ inline void fused_apply(std::int16_t* acc, const std::int8_t* const* add, int na
         vst1q_s16(acc + c,     vaddq_s16(lo, lo2));
         vst1q_s16(acc + c + 8, vaddq_s16(hi, hi2));
     }
+#elif defined(__AVX2__)
+    // AVX2 port of the NEON structure at 32 int16 per chunk (2 x 256-bit), two independent
+    // accumulator lanes to break the add chain. int16 add is associative mod 2^16 -> any
+    // grouping is bit-identical. hl must be a multiple of 32 (it is 512).
+    // Few columns (quiet endgame makes): the fused chunk loop pays 16x the branchy tiny
+    // k-loops (0-3 trips each, mispredicted); a column-outer pass with long predictable
+    // 32-lane loops is cheaper. Same int16 sums -> bit-identical either way.
+    // (x86 campaign A2c: +6.5% on <=6-piece endgames, -3.5% on a few middlegames, +0.44% mean.)
+    // K=2: only 1-add/1-sub makes take the column-outer path (x86 campaign A2d; K=4 traded
+    // -2.2% on every middlegame for +4.5% on endgames and failed the phase guard).
+    constexpr int kSmallCols = 2;
+    if (na + ns <= kSmallCols) {
+        for (int k = 0; k < na; ++k) {
+            const std::int8_t* w = add[k];
+            for (int c = 0; c < hl; c += 32) {
+                __m256i* p0 = reinterpret_cast<__m256i*>(acc + c);
+                __m256i* p1 = reinterpret_cast<__m256i*>(acc + c + 16);
+                _mm256_storeu_si256(p0, _mm256_add_epi16(_mm256_loadu_si256(p0),
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + c)))));
+                _mm256_storeu_si256(p1, _mm256_add_epi16(_mm256_loadu_si256(p1),
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + c + 16)))));
+            }
+        }
+        for (int k = 0; k < ns; ++k) {
+            const std::int8_t* w = sub[k];
+            for (int c = 0; c < hl; c += 32) {
+                __m256i* p0 = reinterpret_cast<__m256i*>(acc + c);
+                __m256i* p1 = reinterpret_cast<__m256i*>(acc + c + 16);
+                _mm256_storeu_si256(p0, _mm256_sub_epi16(_mm256_loadu_si256(p0),
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + c)))));
+                _mm256_storeu_si256(p1, _mm256_sub_epi16(_mm256_loadu_si256(p1),
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + c + 16)))));
+            }
+        }
+        return;
+    }
+    {
+        auto w16 = [](const std::int8_t* p) {
+            return _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+        };
+        int c = 0;
+        for (; c + 64 <= hl; c += 64) {   // 64 int16 per chunk (4 vectors x 2 lanes): fewer iterations, more ILP (A9 +1.2%)
+            __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + c));
+            __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + c + 16));
+            __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + c + 32));
+            __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + c + 48));
+            __m256i u0 = _mm256_setzero_si256(), u1 = u0, u2 = u0, u3 = u0;
+            int k = 0;
+            for (; k + 1 < na; k += 2) {
+                const std::int8_t* p = add[k] + c; const std::int8_t* q = add[k + 1] + c;
+                v0 = _mm256_add_epi16(v0, w16(p)); v1 = _mm256_add_epi16(v1, w16(p + 16)); v2 = _mm256_add_epi16(v2, w16(p + 32)); v3 = _mm256_add_epi16(v3, w16(p + 48));
+                u0 = _mm256_add_epi16(u0, w16(q)); u1 = _mm256_add_epi16(u1, w16(q + 16)); u2 = _mm256_add_epi16(u2, w16(q + 32)); u3 = _mm256_add_epi16(u3, w16(q + 48));
+            }
+            for (; k < na; ++k) {
+                const std::int8_t* p = add[k] + c;
+                v0 = _mm256_add_epi16(v0, w16(p)); v1 = _mm256_add_epi16(v1, w16(p + 16)); v2 = _mm256_add_epi16(v2, w16(p + 32)); v3 = _mm256_add_epi16(v3, w16(p + 48));
+            }
+            for (k = 0; k + 1 < ns; k += 2) {
+                const std::int8_t* p = sub[k] + c; const std::int8_t* q = sub[k + 1] + c;
+                v0 = _mm256_sub_epi16(v0, w16(p)); v1 = _mm256_sub_epi16(v1, w16(p + 16)); v2 = _mm256_sub_epi16(v2, w16(p + 32)); v3 = _mm256_sub_epi16(v3, w16(p + 48));
+                u0 = _mm256_sub_epi16(u0, w16(q)); u1 = _mm256_sub_epi16(u1, w16(q + 16)); u2 = _mm256_sub_epi16(u2, w16(q + 32)); u3 = _mm256_sub_epi16(u3, w16(q + 48));
+            }
+            for (; k < ns; ++k) {
+                const std::int8_t* p = sub[k] + c;
+                v0 = _mm256_sub_epi16(v0, w16(p)); v1 = _mm256_sub_epi16(v1, w16(p + 16)); v2 = _mm256_sub_epi16(v2, w16(p + 32)); v3 = _mm256_sub_epi16(v3, w16(p + 48));
+            }
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + c),      _mm256_add_epi16(v0, u0));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + c + 16), _mm256_add_epi16(v1, u1));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + c + 32), _mm256_add_epi16(v2, u2));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + c + 48), _mm256_add_epi16(v3, u3));
+        }
+        for (; c < hl; c += 32) {   // hl % 64 tail (empty for hl = 512)
+            __m256i lo  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + c));
+            __m256i hi  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + c + 16));
+            __m256i lo2 = _mm256_setzero_si256(), hi2 = _mm256_setzero_si256();
+            int k = 0;
+            for (; k + 1 < na; k += 2) {
+                lo  = _mm256_add_epi16(lo,  w16(add[k] + c));      hi  = _mm256_add_epi16(hi,  w16(add[k] + c + 16));
+                lo2 = _mm256_add_epi16(lo2, w16(add[k + 1] + c));  hi2 = _mm256_add_epi16(hi2, w16(add[k + 1] + c + 16));
+            }
+            for (; k < na; ++k) {
+                lo = _mm256_add_epi16(lo, w16(add[k] + c));  hi = _mm256_add_epi16(hi, w16(add[k] + c + 16));
+            }
+            for (k = 0; k + 1 < ns; k += 2) {
+                lo  = _mm256_sub_epi16(lo,  w16(sub[k] + c));      hi  = _mm256_sub_epi16(hi,  w16(sub[k] + c + 16));
+                lo2 = _mm256_sub_epi16(lo2, w16(sub[k + 1] + c));  hi2 = _mm256_sub_epi16(hi2, w16(sub[k + 1] + c + 16));
+            }
+            for (; k < ns; ++k) {
+                lo = _mm256_sub_epi16(lo, w16(sub[k] + c));  hi = _mm256_sub_epi16(hi, w16(sub[k] + c + 16));
+            }
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + c),      _mm256_add_epi16(lo, lo2));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + c + 16), _mm256_add_epi16(hi, hi2));
+        }
+    }
 #else
     for (int k = 0; k < na; ++k) acc_add(acc, add[k], hl);
     for (int k = 0; k < ns; ++k) acc_sub(acc, sub[k], hl);
+#endif
+}
+
+// dst = src (+ add columns) (- sub columns) in ONE pass: reads src, writes dst. Replaces
+// memcpy(dst, src) + fused_apply(dst, ...): the accumulator is read once and written once
+// per chunk instead of copied, re-read and re-written. int16 sums are order-independent
+// -> bit-identical (x86 campaign G4).
+inline void fused_apply_src(std::int16_t* dst, const std::int16_t* src, const std::int8_t* const* add, int na,
+                            const std::int8_t* const* sub, int ns, int hl) {
+#if defined(__ARM_NEON)
+    // NEON src->dst form of fused_apply (NEON campaign N1): each 16-int16 chunk is read from
+    // src once, every add/sub column is folded in over two independent lanes, and the chunk is
+    // written to dst once -- no memcpy and no per-column accumulator pass (which is what the
+    // #else fallback below costs on ARM). int16 add is associative mod 2^16 -> bit-identical.
+    int c = 0;
+    // N2b: 64 int16 per chunk -- 8 vectors x 2 lanes = 16 accumulators (a full FT row of a column
+    // per two chunk iterations at hl = 512). Same wrapping int16 sums -> bit-identical.
+#define SCN_COL64(V0, V1, V2, V3, V4, V5, V6, V7, P, OP)                                              \
+    {                                                                                                  \
+        const int8x16_t p0 = vld1q_s8((P) + c),      p1 = vld1q_s8((P) + c + 16),                      \
+                        p2 = vld1q_s8((P) + c + 32), p3 = vld1q_s8((P) + c + 48);                      \
+        V0 = OP(V0, vmovl_s8(vget_low_s8(p0)));  V1 = OP(V1, vmovl_s8(vget_high_s8(p0)));             \
+        V2 = OP(V2, vmovl_s8(vget_low_s8(p1)));  V3 = OP(V3, vmovl_s8(vget_high_s8(p1)));             \
+        V4 = OP(V4, vmovl_s8(vget_low_s8(p2)));  V5 = OP(V5, vmovl_s8(vget_high_s8(p2)));             \
+        V6 = OP(V6, vmovl_s8(vget_low_s8(p3)));  V7 = OP(V7, vmovl_s8(vget_high_s8(p3)));             \
+    }
+    for (; c + 64 <= hl; c += 64) {
+        int16x8_t v0 = vld1q_s16(src + c),      v1 = vld1q_s16(src + c + 8),
+                  v2 = vld1q_s16(src + c + 16), v3 = vld1q_s16(src + c + 24),
+                  v4 = vld1q_s16(src + c + 32), v5 = vld1q_s16(src + c + 40),
+                  v6 = vld1q_s16(src + c + 48), v7 = vld1q_s16(src + c + 56);
+        int16x8_t u0 = vdupq_n_s16(0), u1 = u0, u2 = u0, u3 = u0, u4 = u0, u5 = u0, u6 = u0, u7 = u0;
+        int k = 0;
+        for (; k + 1 < na; k += 2) {
+            SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, add[k],     vaddq_s16)
+            SCN_COL64(u0, u1, u2, u3, u4, u5, u6, u7, add[k + 1], vaddq_s16)
+        }
+        for (; k < na; ++k) SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, add[k], vaddq_s16)
+        for (k = 0; k + 1 < ns; k += 2) {
+            SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, sub[k],     vsubq_s16)
+            SCN_COL64(u0, u1, u2, u3, u4, u5, u6, u7, sub[k + 1], vsubq_s16)
+        }
+        for (; k < ns; ++k) SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, sub[k], vsubq_s16)
+        vst1q_s16(dst + c,      vaddq_s16(v0, u0));  vst1q_s16(dst + c + 8,  vaddq_s16(v1, u1));
+        vst1q_s16(dst + c + 16, vaddq_s16(v2, u2));  vst1q_s16(dst + c + 24, vaddq_s16(v3, u3));
+        vst1q_s16(dst + c + 32, vaddq_s16(v4, u4));  vst1q_s16(dst + c + 40, vaddq_s16(v5, u5));
+        vst1q_s16(dst + c + 48, vaddq_s16(v6, u6));  vst1q_s16(dst + c + 56, vaddq_s16(v7, u7));
+    }
+#undef SCN_COL64
+    // N2 (A9-analog): 32 int16 per chunk -- 4 vectors x 2 lanes = 8 accumulators, half the
+    // chunk iterations and twice the independent adds in flight. Same wrapping int16 sums.
+    for (; c + 32 <= hl; c += 32) {
+        int16x8_t v0 = vld1q_s16(src + c),      v1 = vld1q_s16(src + c + 8),
+                  v2 = vld1q_s16(src + c + 16), v3 = vld1q_s16(src + c + 24);
+        int16x8_t u0 = vdupq_n_s16(0), u1 = u0, u2 = u0, u3 = u0;
+        int k = 0;
+        for (; k + 1 < na; k += 2) {
+            const int8x16_t p0 = vld1q_s8(add[k] + c),     p1 = vld1q_s8(add[k] + c + 16);
+            const int8x16_t q0 = vld1q_s8(add[k + 1] + c), q1 = vld1q_s8(add[k + 1] + c + 16);
+            v0 = vaddq_s16(v0, vmovl_s8(vget_low_s8(p0)));  v1 = vaddq_s16(v1, vmovl_s8(vget_high_s8(p0)));
+            v2 = vaddq_s16(v2, vmovl_s8(vget_low_s8(p1)));  v3 = vaddq_s16(v3, vmovl_s8(vget_high_s8(p1)));
+            u0 = vaddq_s16(u0, vmovl_s8(vget_low_s8(q0)));  u1 = vaddq_s16(u1, vmovl_s8(vget_high_s8(q0)));
+            u2 = vaddq_s16(u2, vmovl_s8(vget_low_s8(q1)));  u3 = vaddq_s16(u3, vmovl_s8(vget_high_s8(q1)));
+        }
+        for (; k < na; ++k) {
+            const int8x16_t p0 = vld1q_s8(add[k] + c), p1 = vld1q_s8(add[k] + c + 16);
+            v0 = vaddq_s16(v0, vmovl_s8(vget_low_s8(p0)));  v1 = vaddq_s16(v1, vmovl_s8(vget_high_s8(p0)));
+            v2 = vaddq_s16(v2, vmovl_s8(vget_low_s8(p1)));  v3 = vaddq_s16(v3, vmovl_s8(vget_high_s8(p1)));
+        }
+        for (k = 0; k + 1 < ns; k += 2) {
+            const int8x16_t p0 = vld1q_s8(sub[k] + c),     p1 = vld1q_s8(sub[k] + c + 16);
+            const int8x16_t q0 = vld1q_s8(sub[k + 1] + c), q1 = vld1q_s8(sub[k + 1] + c + 16);
+            v0 = vsubq_s16(v0, vmovl_s8(vget_low_s8(p0)));  v1 = vsubq_s16(v1, vmovl_s8(vget_high_s8(p0)));
+            v2 = vsubq_s16(v2, vmovl_s8(vget_low_s8(p1)));  v3 = vsubq_s16(v3, vmovl_s8(vget_high_s8(p1)));
+            u0 = vsubq_s16(u0, vmovl_s8(vget_low_s8(q0)));  u1 = vsubq_s16(u1, vmovl_s8(vget_high_s8(q0)));
+            u2 = vsubq_s16(u2, vmovl_s8(vget_low_s8(q1)));  u3 = vsubq_s16(u3, vmovl_s8(vget_high_s8(q1)));
+        }
+        for (; k < ns; ++k) {
+            const int8x16_t p0 = vld1q_s8(sub[k] + c), p1 = vld1q_s8(sub[k] + c + 16);
+            v0 = vsubq_s16(v0, vmovl_s8(vget_low_s8(p0)));  v1 = vsubq_s16(v1, vmovl_s8(vget_high_s8(p0)));
+            v2 = vsubq_s16(v2, vmovl_s8(vget_low_s8(p1)));  v3 = vsubq_s16(v3, vmovl_s8(vget_high_s8(p1)));
+        }
+        vst1q_s16(dst + c,      vaddq_s16(v0, u0));  vst1q_s16(dst + c + 8,  vaddq_s16(v1, u1));
+        vst1q_s16(dst + c + 16, vaddq_s16(v2, u2));  vst1q_s16(dst + c + 24, vaddq_s16(v3, u3));
+    }
+    for (; c < hl; c += 16) {   // 16-int16 chunks (the whole vector without N2; the hl % 32 tail with it)
+        int16x8_t lo = vld1q_s16(src + c), hi = vld1q_s16(src + c + 8);
+        int16x8_t lo2 = vdupq_n_s16(0), hi2 = vdupq_n_s16(0);
+        int k = 0;
+        for (; k + 1 < na; k += 2) {
+            const int8x16_t w0 = vld1q_s8(add[k] + c), w1 = vld1q_s8(add[k + 1] + c);
+            lo  = vaddq_s16(lo,  vmovl_s8(vget_low_s8(w0)));  hi  = vaddq_s16(hi,  vmovl_s8(vget_high_s8(w0)));
+            lo2 = vaddq_s16(lo2, vmovl_s8(vget_low_s8(w1)));  hi2 = vaddq_s16(hi2, vmovl_s8(vget_high_s8(w1)));
+        }
+        for (; k < na; ++k) {
+            const int8x16_t w = vld1q_s8(add[k] + c);
+            lo = vaddq_s16(lo, vmovl_s8(vget_low_s8(w)));  hi = vaddq_s16(hi, vmovl_s8(vget_high_s8(w)));
+        }
+        for (k = 0; k + 1 < ns; k += 2) {
+            const int8x16_t w0 = vld1q_s8(sub[k] + c), w1 = vld1q_s8(sub[k + 1] + c);
+            lo  = vsubq_s16(lo,  vmovl_s8(vget_low_s8(w0)));  hi  = vsubq_s16(hi,  vmovl_s8(vget_high_s8(w0)));
+            lo2 = vsubq_s16(lo2, vmovl_s8(vget_low_s8(w1)));  hi2 = vsubq_s16(hi2, vmovl_s8(vget_high_s8(w1)));
+        }
+        for (; k < ns; ++k) {
+            const int8x16_t w = vld1q_s8(sub[k] + c);
+            lo = vsubq_s16(lo, vmovl_s8(vget_low_s8(w)));  hi = vsubq_s16(hi, vmovl_s8(vget_high_s8(w)));
+        }
+        vst1q_s16(dst + c,     vaddq_s16(lo, lo2));
+        vst1q_s16(dst + c + 8, vaddq_s16(hi, hi2));
+    }
+#elif defined(__AVX2__)
+    auto w16 = [](const std::int8_t* p) {
+        return _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    };
+    if (na + ns <= 2) {   // A2d: 1-add/1-sub makes go column-outer (long predictable loops)
+        const std::int16_t* s = src;
+        for (int k = 0; k < na; ++k, s = dst) {
+            const std::int8_t* w = add[k];
+            for (int c = 0; c < hl; c += 32) {
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c),
+                    _mm256_add_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + c)), w16(w + c)));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + 16),
+                    _mm256_add_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + c + 16)), w16(w + c + 16)));
+            }
+        }
+        for (int k = 0; k < ns; ++k, s = dst) {
+            const std::int8_t* w = sub[k];
+            for (int c = 0; c < hl; c += 32) {
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c),
+                    _mm256_sub_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + c)), w16(w + c)));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + 16),
+                    _mm256_sub_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + c + 16)), w16(w + c + 16)));
+            }
+        }
+        if (s == src) std::memcpy(dst, src, static_cast<std::size_t>(hl) * sizeof(std::int16_t));  // no columns at all
+        return;
+    }
+    int c = 0;
+    for (; c + 64 <= hl; c += 64) {   // 64 int16 per chunk (4 vectors x 2 lanes), src -> dst (A9)
+        __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c));
+        __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c + 16));
+        __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c + 32));
+        __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c + 48));
+        __m256i u0 = _mm256_setzero_si256(), u1 = u0, u2 = u0, u3 = u0;
+        int k = 0;
+        for (; k + 1 < na; k += 2) {
+            const std::int8_t* p = add[k] + c; const std::int8_t* q = add[k + 1] + c;
+            v0 = _mm256_add_epi16(v0, w16(p)); v1 = _mm256_add_epi16(v1, w16(p + 16)); v2 = _mm256_add_epi16(v2, w16(p + 32)); v3 = _mm256_add_epi16(v3, w16(p + 48));
+            u0 = _mm256_add_epi16(u0, w16(q)); u1 = _mm256_add_epi16(u1, w16(q + 16)); u2 = _mm256_add_epi16(u2, w16(q + 32)); u3 = _mm256_add_epi16(u3, w16(q + 48));
+        }
+        for (; k < na; ++k) {
+            const std::int8_t* p = add[k] + c;
+            v0 = _mm256_add_epi16(v0, w16(p)); v1 = _mm256_add_epi16(v1, w16(p + 16)); v2 = _mm256_add_epi16(v2, w16(p + 32)); v3 = _mm256_add_epi16(v3, w16(p + 48));
+        }
+        for (k = 0; k + 1 < ns; k += 2) {
+            const std::int8_t* p = sub[k] + c; const std::int8_t* q = sub[k + 1] + c;
+            v0 = _mm256_sub_epi16(v0, w16(p)); v1 = _mm256_sub_epi16(v1, w16(p + 16)); v2 = _mm256_sub_epi16(v2, w16(p + 32)); v3 = _mm256_sub_epi16(v3, w16(p + 48));
+            u0 = _mm256_sub_epi16(u0, w16(q)); u1 = _mm256_sub_epi16(u1, w16(q + 16)); u2 = _mm256_sub_epi16(u2, w16(q + 32)); u3 = _mm256_sub_epi16(u3, w16(q + 48));
+        }
+        for (; k < ns; ++k) {
+            const std::int8_t* p = sub[k] + c;
+            v0 = _mm256_sub_epi16(v0, w16(p)); v1 = _mm256_sub_epi16(v1, w16(p + 16)); v2 = _mm256_sub_epi16(v2, w16(p + 32)); v3 = _mm256_sub_epi16(v3, w16(p + 48));
+        }
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c),      _mm256_add_epi16(v0, u0));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + 16), _mm256_add_epi16(v1, u1));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + 32), _mm256_add_epi16(v2, u2));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + 48), _mm256_add_epi16(v3, u3));
+    }
+    for (; c < hl; c += 32) {   // hl % 64 tail (empty for hl = 512)
+        __m256i lo  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c));
+        __m256i hi  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c + 16));
+        __m256i lo2 = _mm256_setzero_si256(), hi2 = _mm256_setzero_si256();
+        int k = 0;
+        for (; k + 1 < na; k += 2) {
+            lo  = _mm256_add_epi16(lo,  w16(add[k] + c));      hi  = _mm256_add_epi16(hi,  w16(add[k] + c + 16));
+            lo2 = _mm256_add_epi16(lo2, w16(add[k + 1] + c));  hi2 = _mm256_add_epi16(hi2, w16(add[k + 1] + c + 16));
+        }
+        for (; k < na; ++k) {
+            lo = _mm256_add_epi16(lo, w16(add[k] + c));  hi = _mm256_add_epi16(hi, w16(add[k] + c + 16));
+        }
+        for (k = 0; k + 1 < ns; k += 2) {
+            lo  = _mm256_sub_epi16(lo,  w16(sub[k] + c));      hi  = _mm256_sub_epi16(hi,  w16(sub[k] + c + 16));
+            lo2 = _mm256_sub_epi16(lo2, w16(sub[k + 1] + c));  hi2 = _mm256_sub_epi16(hi2, w16(sub[k + 1] + c + 16));
+        }
+        for (; k < ns; ++k) {
+            lo = _mm256_sub_epi16(lo, w16(sub[k] + c));  hi = _mm256_sub_epi16(hi, w16(sub[k] + c + 16));
+        }
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c),      _mm256_add_epi16(lo, lo2));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + 16), _mm256_add_epi16(hi, hi2));
+    }
+#else
+    std::memcpy(dst, src, static_cast<std::size_t>(hl) * sizeof(std::int16_t));
+    for (int k = 0; k < na; ++k) acc_add(dst, add[k], hl);
+    for (int k = 0; k < ns; ++k) acc_sub(dst, sub[k], hl);
 #endif
 }
 
@@ -935,8 +1343,13 @@ Value finish_body(const Net& n, const float* x1, int b) {
     const float* l2w = n.l2w.data();
     const float* l2b = n.l2b.data() + b * 32;
     const std::size_t ostride = static_cast<std::size_t>(OB) * 32;
+    (void)ostride;   // used by the scalar fallback only (NEON reads l2w_bm, AVX2 reads l2w_bm)
 #if defined(__ARM_NEON)
     const float* w2base = l2w + static_cast<std::size_t>(b) * 32;  // row i at + i*ostride + o
+    // N6 (G2 port): the bucket-major copy [(b*L2 + i)*32 + o] -- 4 KB contiguous per bucket, row i
+    // at + i*32 -- instead of 32 rows at a 1 KB stride. Same values, same fma order -> bit-identical.
+    const float* w2bm = n.l2w_bm.data() + static_cast<std::size_t>(b) * L2 * 32;
+    (void)w2base;
     if (!g_l1dense && L2 == 32) {
         // §L3: NNZ sparse L2 (input-major over nonzero x1). screlu(x1) >= 0, ~half zero;
         // a skipped x1[i]==0 adds w*0.0f == 0 exactly -> per output the ascending-i fmla
@@ -947,7 +1360,7 @@ Value finish_body(const Net& n, const float* x1, int b) {
                     c4=vld1q_f32(l2b+16), c5=vld1q_f32(l2b+20), c6=vld1q_f32(l2b+24), c7=vld1q_f32(l2b+28);
         for (int k = 0; k < nnz2; ++k) {
             const int i = nz2[k]; const float xi = x1[i];
-            const float* w = w2base + static_cast<std::size_t>(i) * ostride;
+            const float* w = w2bm + static_cast<std::size_t>(i) * 32;
             c0=vfmaq_n_f32(c0, vld1q_f32(w),    xi); c1=vfmaq_n_f32(c1, vld1q_f32(w+4),  xi);
             c2=vfmaq_n_f32(c2, vld1q_f32(w+8),  xi); c3=vfmaq_n_f32(c3, vld1q_f32(w+12), xi);
             c4=vfmaq_n_f32(c4, vld1q_f32(w+16), xi); c5=vfmaq_n_f32(c5, vld1q_f32(w+20), xi);
@@ -963,10 +1376,37 @@ Value finish_body(const Net& n, const float* x1, int b) {
     for (int o = 0; o < 32; o += 4) {
         float32x4_t acc = vld1q_f32(l2b + o);
         for (int i = 0; i < L2; ++i)
-            acc = vfmaq_n_f32(acc, vld1q_f32(l2w + static_cast<std::size_t>(i) * ostride + b * 32 + o), x1[i]);
+            acc = vfmaq_n_f32(acc, vld1q_f32(w2bm + static_cast<std::size_t>(i) * 32 + o), x1[i]);
         float tmp[4];
         vst1q_f32(tmp, acc);
         for (int k = 0; k < 4; ++k) x2[o + k] = screlu(tmp[k]);
+    }
+#elif defined(__AVX2__)
+    // AVX2: 4 x 8 outputs, i-outer. Per output the ascending-i FMA chain is exactly the
+    // fp-contracted scalar chain (s = fma(x1[i], w, s)) -> bit-identical. Rows are 32
+    // contiguous floats at l2w + i*ostride + b*32 (the scalar loop walks them with a
+    // 1 KB stride per output instead).
+    {
+        const float* w2base = n.l2w_bm.data() + static_cast<std::size_t>(b) * L2 * 32;   // contiguous rows of 32 (G2)
+        constexpr std::size_t wstride = 32;
+        (void)l2w;
+        __m256 c0 = _mm256_loadu_ps(l2b), c1 = _mm256_loadu_ps(l2b + 8),
+               c2 = _mm256_loadu_ps(l2b + 16), c3 = _mm256_loadu_ps(l2b + 24);
+        for (int i = 0; i < L2; ++i) {
+            const __m256 xi = _mm256_set1_ps(x1[i]);
+            const float* w = w2base + static_cast<std::size_t>(i) * wstride;
+            c0 = _mm256_fmadd_ps(xi, _mm256_loadu_ps(w),      c0);
+            c1 = _mm256_fmadd_ps(xi, _mm256_loadu_ps(w + 8),  c1);
+            c2 = _mm256_fmadd_ps(xi, _mm256_loadu_ps(w + 16), c2);
+            c3 = _mm256_fmadd_ps(xi, _mm256_loadu_ps(w + 24), c3);
+        }
+        alignas(32) float tmp[32];
+        _mm256_store_ps(tmp, c0); _mm256_store_ps(tmp + 8, c1);
+        _mm256_store_ps(tmp + 16, c2); _mm256_store_ps(tmp + 24, c3);
+        for (int o = 0; o < 32; o += 8) {   // 8-wide screlu, same ops per lane (clamp, square); A7
+            __m256 v = _mm256_min_ps(_mm256_max_ps(_mm256_load_ps(tmp + o), _mm256_setzero_ps()), _mm256_set1_ps(1.0f));
+            _mm256_storeu_ps(x2.data() + o, _mm256_mul_ps(v, v));
+        }
     }
 #else
     for (int o = 0; o < 32; ++o) {
@@ -977,8 +1417,10 @@ Value finish_body(const Net& n, const float* x1, int b) {
     }
 #endif
     y = n.l3b[b];
-    for (int i = 0; i < 32; ++i)
-        y += x2[i] * n.l3w[static_cast<std::size_t>(i) * OB + b];
+    {   // contiguous per-bucket L3 row (A6); the sequential fma chain is unchanged -> bit-identical
+        const float* w3 = n.l3w_t.data() + static_cast<std::size_t>(b) * 32;
+        for (int i = 0; i < 32; ++i) y += x2[i] * w3[i];
+    }
     const float cp = std::clamp(400.0f * y, -15000.0f, 15000.0f);
     return static_cast<Value>(std::lround(cp));
 }
@@ -1177,7 +1619,7 @@ Value eval_quant(const Board& board) {
         acc_ntm = acc_buf_ntm;
     }
 
-    // Int8 pairwise activation (SF-style): crelu-clamp to [0,QA], multiply the
+    // Int8 pairwise activation: crelu-clamp to [0,QA], multiply the
     // two halves, and scale down by QA so the result fits int8 [0,QA]. This is
     // the L1 input for the sdot dot-products (h8 = pairwise * QA).
     alignas(16) std::int8_t h8[MAX_HL];
@@ -1212,6 +1654,46 @@ Value eval_quant(const Board& board) {
     const std::int8_t* wbucket = n.l1w_dot.data() + static_cast<std::size_t>(b) * L2 * hl;
     float x1[MAX_L2];
 #if defined(__ARM_FEATURE_DOTPROD)
+    // NEON campaign N5 (A1-analog): 4 outputs per pass, each on TWO independent vdotq chains --
+    // 8 dot chains in flight instead of one serial 32-op chain per output (latency-bound), and
+    // every h8 vector is loaded once for 4 outputs. Integer sums are order-independent and
+    // cannot overflow (|sum| <= 512*127*127) -> bit-identical to the one-chain form.
+    {
+        int o = 0;
+        for (; o + 4 <= L2; o += 4) {
+            const std::int8_t* w0 = wbucket + static_cast<std::size_t>(o) * hl;
+            const std::int8_t* w1 = w0 + hl;
+            const std::int8_t* w2 = w1 + hl;
+            const std::int8_t* w3 = w2 + hl;
+            int32x4_t a0 = vdupq_n_s32(0), a1 = a0, a2 = a0, a3 = a0;
+            int32x4_t c0 = a0, c1 = a0, c2 = a0, c3 = a0;
+            int i = 0;
+            for (; i + 32 <= hl; i += 32) {
+                const int8x16_t h = vld1q_s8(h8 + i), h2 = vld1q_s8(h8 + i + 16);
+                a0 = vdotq_s32(a0, h, vld1q_s8(w0 + i));  c0 = vdotq_s32(c0, h2, vld1q_s8(w0 + i + 16));
+                a1 = vdotq_s32(a1, h, vld1q_s8(w1 + i));  c1 = vdotq_s32(c1, h2, vld1q_s8(w1 + i + 16));
+                a2 = vdotq_s32(a2, h, vld1q_s8(w2 + i));  c2 = vdotq_s32(c2, h2, vld1q_s8(w2 + i + 16));
+                a3 = vdotq_s32(a3, h, vld1q_s8(w3 + i));  c3 = vdotq_s32(c3, h2, vld1q_s8(w3 + i + 16));
+            }
+            for (; i < hl; i += 16) {   // hl % 32 tail (empty for hl = 512)
+                const int8x16_t h = vld1q_s8(h8 + i);
+                a0 = vdotq_s32(a0, h, vld1q_s8(w0 + i));  a1 = vdotq_s32(a1, h, vld1q_s8(w1 + i));
+                a2 = vdotq_s32(a2, h, vld1q_s8(w2 + i));  a3 = vdotq_s32(a3, h, vld1q_s8(w3 + i));
+            }
+            const float* bias = n.l1b.data() + b * L2 + o;
+            x1[o]     = screlu(static_cast<float>(vaddvq_s32(vaddq_s32(a0, c0))) / DEQ + bias[0]);
+            x1[o + 1] = screlu(static_cast<float>(vaddvq_s32(vaddq_s32(a1, c1))) / DEQ + bias[1]);
+            x1[o + 2] = screlu(static_cast<float>(vaddvq_s32(vaddq_s32(a2, c2))) / DEQ + bias[2]);
+            x1[o + 3] = screlu(static_cast<float>(vaddvq_s32(vaddq_s32(a3, c3))) / DEQ + bias[3]);
+        }
+        for (; o < L2; ++o) {   // L2 % 4 tail (empty for L2 = 32)
+            const std::int8_t* w = wbucket + static_cast<std::size_t>(o) * hl;
+            int32x4_t acc4 = vdupq_n_s32(0);
+            for (int i = 0; i < hl; i += 16) acc4 = vdotq_s32(acc4, vld1q_s8(h8 + i), vld1q_s8(w + i));
+            x1[o] = screlu(static_cast<float>(vaddvq_s32(acc4)) / DEQ + n.l1b[b * L2 + o]);
+        }
+    }
+#elif defined(__ARM_FEATURE_DOTPROD)
     // Dense int8 sdot. NNZ sparse (input-major over nonzero h8) was tried and lost
     // hard on NEON (-20%): vdotq packs 16 MACs + reduction per op, so the ~76% h8
     // sparsity can't beat it (see NNUE_SPEED_TODO_2.md item 6).
@@ -1221,6 +1703,57 @@ Value eval_quant(const Board& board) {
         for (int i = 0; i < hl; i += 16)
             acc4 = vdotq_s32(acc4, vld1q_s8(h8 + i), vld1q_s8(w + i));
         x1[o] = screlu(static_cast<float>(vaddvq_s32(acc4)) / DEQ + n.l1b[b * L2 + o]);
+    }
+#elif defined(__AVX2__)
+    // AVX2 counterpart of the sdot path. h8 is in [0,QA]=[0,127], i.e. a valid UNSIGNED
+    // byte, and l1w_dot is signed int8: VPMADDUBSW (u8*s8, adjacent pairs summed into
+    // int16) then VPMADDWD (int16 pairs -> int32). Saturation is impossible: a pair sum
+    // is at most 2*127*127 = 32258 < 32767. Integer sums are order-independent, so the
+    // result equals the scalar int32 accumulation exactly (bit-identical). Four outputs
+    // share every 32-byte h8 load; the epilogue is the scalar one, verbatim.
+    {
+        const __m256i ones16 = _mm256_set1_epi16(1);
+        auto hsum32 = [](__m256i v) -> std::int32_t {
+            __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+            s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+            s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+            return _mm_cvtsi128_si32(s);
+        };
+        auto ld = [](const std::int8_t* p) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)); };
+        int o = 0;
+        for (; o + 4 <= L2; o += 4) {
+            const std::int8_t* w0 = wbucket + static_cast<std::size_t>(o) * hl;
+            const std::int8_t* w1 = w0 + hl;
+            const std::int8_t* w2 = w1 + hl;
+            const std::int8_t* w3 = w2 + hl;
+            __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+            int i = 0;
+            for (; i + 32 <= hl; i += 32) {
+                const __m256i h = ld(h8 + i);
+                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(h, ld(w0 + i)), ones16));
+                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(h, ld(w1 + i)), ones16));
+                a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_maddubs_epi16(h, ld(w2 + i)), ones16));
+                a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_maddubs_epi16(h, ld(w3 + i)), ones16));
+            }
+            std::int32_t s0 = hsum32(a0), s1 = hsum32(a1), s2 = hsum32(a2), s3 = hsum32(a3);
+            for (; i < hl; ++i) {  // hl % 32 tail (empty for hl = 512)
+                s0 += static_cast<int>(h8[i]) * w0[i]; s1 += static_cast<int>(h8[i]) * w1[i];
+                s2 += static_cast<int>(h8[i]) * w2[i]; s3 += static_cast<int>(h8[i]) * w3[i];
+            }
+            {   // 4-wide epilogue -- the same IEEE ops per lane as the scalar form
+                // (int->float, divide by DEQ, add bias, clamp to [0,1], square). x86 campaign A7: +1.04%.
+                const __m128 sv = _mm_cvtepi32_ps(_mm_setr_epi32(s0, s1, s2, s3));
+                __m128 v = _mm_add_ps(_mm_div_ps(sv, _mm_set1_ps(DEQ)), _mm_loadu_ps(n.l1b.data() + b * L2 + o));
+                v = _mm_min_ps(_mm_max_ps(v, _mm_setzero_ps()), _mm_set1_ps(1.0f));
+                _mm_storeu_ps(x1 + o, _mm_mul_ps(v, v));
+            }
+        }
+        for (; o < L2; ++o) {  // L2 % 4 tail (empty for L2 = 32)
+            const std::int8_t* w = wbucket + static_cast<std::size_t>(o) * hl;
+            std::int32_t s = 0;
+            for (int i = 0; i < hl; ++i) s += static_cast<int>(h8[i]) * w[i];
+            x1[o] = screlu(static_cast<float>(s) / DEQ + n.l1b[b * L2 + o]);
+        }
     }
 #else
     for (int o = 0; o < L2; ++o) {
@@ -1270,6 +1803,12 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         if constexpr (FX) fused_apply_fx(acc, add, na, sub, ns, hl);
         else              fused_apply(acc, add, na, sub, ns, hl);
     };
+    // G4 single pass: dst = src +/- columns (quant path only; the float labeler keeps two passes).
+    [[maybe_unused]] auto fused_src = [&](auto* dst, const auto* src, const WT* const* add, int na,
+                                          const WT* const* sub, int ns) {
+        if constexpr (!FX) fused_apply_src(dst, src, add, na, sub, ns, hl);
+        else { (void)dst; (void)src; (void)add; (void)na; (void)sub; (void)ns; }
+    };
     const int from = m.from().index(), to = m.to().index();
     const int moved_pi = static_cast<int>(before.at(m.from()).internal());
     const int mcolor = moved_pi / 6, mt0 = moved_pi % 6;
@@ -1297,26 +1836,40 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         special = false;
     }
     if (special) {
-        Board tmp = before;
-        tmp.makeMove(m);
-        refresh_fn(nxt, tmp);
-        g_bb[g_ply + 1] = BB(tmp);  // keep the incremental BB chain in sync
+        // G8: make the move on the caller's own board and unmake it after the refresh,
+        // instead of copying the Board (which deep-copies its undo stack) per refresh.
+        // Every caller passes its mutable search board; the refresh reads exactly the
+        // state a copy would have had, and unmakeMove restores the board in full.
+        Board& b = const_cast<Board&>(before);
+        b.makeMove(m);
+        refresh_fn(nxt, b);
+        g_bb[g_ply + 1] = BB(b);  // keep the incremental BB chain in sync
+        b.unmakeMove(m);
     } else {
-        std::memcpy(nxt.v[0], cur.v[0], hl * sizeof(nxt.v[0][0]));
-        std::memcpy(nxt.v[1], cur.v[1], hl * sizeof(nxt.v[0][0]));
+        // Single pass (quant + direct path; x86 campaign G4, +3.7% all phases): the base
+        // columns are deferred into the threat add/sub lists and ONE src->dst fused pass per
+        // perspective reads cur and writes nxt -- no 2x1 KB memcpy, no separate base pass.
+        // int16 sums are order-independent -> bit-identical. The probes (NOUPDATE/NOCOLS/
+        // NODIRECT) and the float labeler keep the two-pass form.
+        const bool single_pass = !FX && g_direct && !g_no_update && !g_no_cols;
+        if (!single_pass) {
+            std::memcpy(nxt.v[0], cur.v[0], hl * sizeof(nxt.v[0][0]));
+            std::memcpy(nxt.v[1], cur.v[1], hl * sizeof(nxt.v[0][0]));
+        }
         const int kabs[2] = {before.kingSq(Color::WHITE).index(), before.kingSq(Color::BLACK).index()};
         const chess::Piece capp = before.at(m.to());
         const bool cap = (capp != chess::Piece::NONE);
         const int cpi = cap ? static_cast<int>(capp.internal()) : 0;
-        // ---- base delta (piece-square), one fused accumulator pass per persp ----
+        // ---- base delta (piece-square): one fused pass per persp, or deferred into the
+        // threat lists when single_pass (G4) ----
+        const WT* base_add[2];
+        const WT* base_sub[2][2];
+        const int nbase_sub = cap ? 2 : 1;
         for (int p = 0; p < 2; ++p) {
-            const WT* ba[1];
-            const WT* bs[2];
-            ba[0] = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, to, kabs[p])) * hl;
-            bs[0] = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, from, kabs[p])) * hl;
-            int nbs = 1;
-            if (cap) bs[nbs++] = l0 + static_cast<std::size_t>(base_feat(p, cpi / 6, cpi % 6, to, kabs[p])) * hl;
-            fused(nxt.v[p], ba, 1, bs, nbs);
+            base_add[p]    = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, to, kabs[p])) * hl;
+            base_sub[p][0] = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, from, kabs[p])) * hl;
+            if (cap) base_sub[p][1] = l0 + static_cast<std::size_t>(base_feat(p, cpi / 6, cpi % 6, to, kabs[p])) * hl;
+            if (!single_pass) fused(nxt.v[p], &base_add[p], 1, base_sub[p], nbase_sub);
         }
         // ---- threat + pp delta (exact: collect before/after feature sets over
         // the affected pieces, then apply only the multiset difference) ----
@@ -1357,6 +1910,12 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         static thread_local const WT* addp[2][1024];
         static thread_local const WT* subp[2][1024];
         int na[2] = {0, 0}, ns[2] = {0, 0};
+        if (single_pass)   // G4: the base columns ride in the same lists as the threat/pp columns
+            for (int p = 0; p < 2; ++p) {
+                addp[p][na[p]++] = base_add[p];
+                subp[p][ns[p]++] = base_sub[p][0];
+                if (cap) subp[p][ns[p]++] = base_sub[p][1];
+            }
         auto push = [&](int p, std::uint32_t idx, bool add) {
             const WT* col = l0 + (bd + idx) * hl;
             if (add) addp[p][na[p]++] = col; else subp[p][ns[p]++] = col;
@@ -1468,8 +2027,13 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
                 for (int k = 0; k < ns[p]; ++k) __builtin_prefetch(subp[p][k]);
             }
         if (!g_no_cols) {  // NOCOLS probe: keep enumeration, skip the column adds
-            fused(nxt.v[0], addp[0], na[0], subp[0], ns[0]);
-            fused(nxt.v[1], addp[1], na[1], subp[1], ns[1]);
+            if (single_pass) {   // G4: cur -> nxt in one pass (base + threat + pp columns)
+                fused_src(nxt.v[0], cur.v[0], addp[0], na[0], subp[0], ns[0]);
+                fused_src(nxt.v[1], cur.v[1], addp[1], na[1], subp[1], ns[1]);
+            } else {
+                fused(nxt.v[0], addp[0], na[0], subp[0], ns[0]);
+                fused(nxt.v[1], addp[1], na[1], subp[1], ns[1]);
+            }
         }
       } else if constexpr (!FX) {  // int16-only collect+diff fallback (SCNNUE_NODIRECT)
         static thread_local FeatList bef, aft;

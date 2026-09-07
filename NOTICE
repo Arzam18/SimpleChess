@@ -1,0 +1,26 @@
+SimpleChess — third-party notices
+
+SimpleChess is licensed under the GNU General Public License v3.0 (see LICENSE).
+The following portion is derived from another GPL-3.0 work and is reproduced
+here under that license, with the original copyright notice preserved as the
+license requires:
+
+  src/nnue.cpp — the threat-feature index-table construction (build_tables and
+  make_threat_index: the per-piece square offsets, the attacker/attacked index
+  table, and the per-square attack-order table) is a translation of the
+  corresponding lookup-table initialisation in Stockfish's
+  src/nnue/features/full_threats.cpp and full_threats.h.
+    Copyright (C) 2004-2026 The Stockfish developers (see the Stockfish AUTHORS file)
+    Licensed under the GNU General Public License v3.0 or later.
+
+Vendored third-party libraries (each under its own license, GPL-3.0-compatible):
+
+  external/chess-library/ — move generation; carries its own license there.
+
+  external/Fathom/ — Syzygy endgame-tablebase probing (Fathom), used by
+  src/syzygy.cpp. MIT License; the full text is at external/Fathom/src/LICENSE.
+    Copyright (c) 2013-2018 Ronald de Man
+    Copyright (c) 2015 basil00
+    Copyright (c) 2016-2024 Jon Dart
+
+All other code in this repository is original to SimpleChess.

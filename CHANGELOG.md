@@ -1,8 +1,37 @@
 # Changelog
 
-Release history for Simple Chess. An entry is added here whenever a tested candidate is promoted to the live `simplechess` binary via `tools/version.py promote`. Every version — accepted or not — is also kept as a runnable binary in `versions/`.
+Release history for SimpleChess. An entry is added here whenever a tested candidate is promoted to the live `simplechess` binary.
 
 <!-- new entries inserted below this line by `version.py promote` -->
+
+## v3.1.0 — 2026-09-07
+
+- Self-reports: `SimpleChess 3.1.0`
+- Source VERSION at save time: `3.1.0`
+
+Syzygy endgame tablebases (Fathom, MIT): interior WDL probing behind `SyzygyPath` /
+`SyzygyProbeDepth` / `SyzygyProbeLimit` / `Syzygy50MoveRule`, `tbhits` in the info line;
+verified against python-chess (correctness-only — no strength claim).
+
+Two speed campaigns, every item bit-identical to 3.0.0's search (same nodes/score/PV at
+fixed depth on 28 positions) — the strength gain below is node rate turned into depth:
+- x86/AVX2 (Windows, i7-9700; 52 items tried, 28 kept): AVX2
+  kernels for the int8 L1 dot (maddubs), fused accumulator updates, the L2 matvec and the
+  epilogues; single-pass make, fused refresh, child-key TT prefetch, 64-byte weight
+  alignment, Windows large pages for the TT and FT weights, PEXT magics, thin LTO, PGO.
+  +131% nps @1T; 4T/1GB ≈ 90% of Stockfish 18's node rate on the 30-position suite (from 45%).
+- NEON (macOS, M1 Max; 24 items tried, 5 kept): the AVX2 ideas
+  ported — src→dst fused pass, 4-output×2-chain `vdotq` L1 dot (+23.7% alone), 64-wide
+  fused chunks; the x86 items re-measured on ARM (four now x86-only behind `#if defined(__ARM_NEON)`:
+  the 64-B allocator, the off-check pawn hash, the SEE tri-state, the persistent thread pool).
+  +59% nps @1T over 3.0.0's Mac build; 4T/1GB ≈ 97% of Stockfish 18's node rate on the same
+  suite (from 61%); midgame 1.00M nps @1T.
+Build: Makefile/CMake pick `-march=native` on x86 hosts (`-mcpu=native` on Apple Silicon);
+PGO builds keep `EXTRA` defines; PGO workload runs in a sandbox for deterministic profiles.
+
+BEATS 3.0.0 by +77 Elo [+63, +92] LOS 100%: +173 =400 -39 (61.0%) over 612 games
+@10+0.1s/1T/256MB, paired openings, pentanomial [0/22/146/120/18] (stopped at a ±15 Elo
+95% CI; macOS M1 Max, both engines on SCNNUEv3-2026-08-30).
 
 ## v3.0.0 — 2026-08-30
 
@@ -65,14 +94,14 @@ Net trained on pooled 20M search-labeled self-play (v0.2's 10M + fresh 10M gener
 - Self-reports: `Simple Chess NNUE 0.2`
 - Source VERSION at save time: `0.2`
 
-PSQT+material anchor (Stockfish 14 psqt.cpp/types.h, rescaled) replaces flat-material anchor on the pure-NNUE path; net trained on 10M search-labeled self-play (2x5M, fused-eval depth-8 labels) with lambda=0.7 blend, early-stopped epoch 10. Beat v0.1 net +285 Elo [95% CI +251,+325], 500g depth 10, 83.8%.
+PSQT+material anchor (classical piece-square tables, rescaled) replaces flat-material anchor on the pure-NNUE path; net trained on 10M search-labeled self-play (2x5M, fused-eval depth-8 labels) with lambda=0.7 blend, early-stopped epoch 10. Beat v0.1 net +285 Elo [95% CI +251,+325], 500g depth 10, 83.8%.
 
 ## v1.7 — 2026-07-24
 
 - Self-reports: `Simple Chess 1.7`
 - Source VERSION at save time: `1.7`
 
-Tempo bonus: flat +16 cp for the side to move, added post-taper on every return path (lazy exit included). Standard top-HCE term (SF classical 28, Ethereal 20, Weiss 18); 16 tuned in-engine via a 5-point sweep (8/12/16/20/28) against v1.6.4. Result: +20 Elo [+1, +40], LOS 97.8% at 300ms/500g (the deeper, more realistic control); ~neutral (+6) at 60ms. Zero NPS cost — a single add. Gauntlet placed it #2 at 2656, a statistical tie with v1.6 (2662, gap 6 +-17); promoted on the significant longer-TC evidence per Sam's call that the 300ms result is the more trustworthy signal.
+Tempo bonus: flat +16 cp for the side to move, added post-taper on every return path (lazy exit included). Standard hand-crafted-eval term (typical values 18-28 cp); 16 tuned in-engine via a 5-point sweep (8/12/16/20/28) against v1.6.4. Result: +20 Elo [+1, +40], LOS 97.8% at 300ms/500g (the deeper, more realistic control); ~neutral (+6) at 60ms. Zero NPS cost — a single add. Gauntlet placed it #2 at 2656, a statistical tie with v1.6 (2662, gap 6 +-17); promoted on the significant longer-TC evidence per Sam's call that the 300ms result is the more trustworthy signal.
 
 ## v1.6.4 — 2026-07-23
 
@@ -144,7 +173,7 @@ file, rook behind passed pawn). Promoted on a 60ms sweep showing +49 Elo vs v1.2
 (LOS 99.7%), then **reverted**: a depth-10 gauntlet had it at −14 vs v1.2 and −9 vs
 v1.0. With search speed neutralised by fixed depth, the terms added no evaluation
 quality — the 60ms gain was speed-derived, not knowledge. Live version rolled back
-to v1.2; the code remains archived under `versions/v1.3-rooks-reverted/` (renamed
+to v1.2; the code remains archived in the dev repo (renamed
 to free the `v1.3` name for the pawn-storm release above).
 
 ## v1.2 — 2026-07-19
@@ -187,14 +216,14 @@ integrated king safety (extends v0.3 king-attack): shelter/exposure (queen-gated
 - Self-reports: `Simple Chess 0.7`
 - Source VERSION at save time: `0.7`
 
-adaptive continuous search width (SF-style): root-gap x score x phase signal scales LMR/LMP/futility; endgames+decisive stay full-depth; SC_BREADTH=64 sweep winner (+38 Elo @ 60ms/100g vs v0.6, curve peak of 32-160)
+adaptive continuous search width: root-gap x score x phase signal scales LMR/LMP/futility; endgames+decisive stay full-depth; SC_BREADTH=64 sweep winner (+38 Elo @ 60ms/100g vs v0.6, curve peak of 32-160)
 
 ## v0.6 — 2026-07-17
 
 - Self-reports: `Simple Chess 0.6`
 - Source VERSION at save time: `0.6`
 
-clock: SF-style ply-scaled time allocation (less in opening), hard cap min(60s,10% remaining); only-move early exit (>=100cp over 2nd best, stable, depth>=16, real clock only)
+clock: ply-scaled time allocation (less in opening), hard cap min(60s,10% remaining); only-move early exit (>=100cp over 2nd best, stable, depth>=16, real clock only)
 
 ## v0.5 — 2026-07-17
 

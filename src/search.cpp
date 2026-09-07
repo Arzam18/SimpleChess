@@ -37,6 +37,7 @@
 #include "movepick.hpp"
 #include "nnue.hpp"
 #include "see.hpp"
+#include "syzygy.hpp"
 
 namespace engine {
 
@@ -137,8 +138,8 @@ constexpr int   kEffortMaxCutPct = 60;  // strongest trim, at a 100% share
 
 // ---- Adaptive search width (v0.7) ----
 // Rather than a binary mode switch, width adapts *continuously* to position
-// character: Leela's PUCT spreads visits wide when many moves have similar
-// Q-values and goes deep when one dominates; the equivalent here is to shrink
+// character: when several root moves score close together the tree should be
+// wide, and when one clearly dominates it should be deep. Concretely, shrink
 // LMR reductions (widening the tree) in unclear positions and grow them on
 // decisive mainlines. The main worker recomputes a width in [0, SC_BREADTH]
 // after each iteration as the product of three fading signals —
@@ -200,16 +201,25 @@ const auto kLmr = [] {
 Search::~Search() {
     stop();
     wait();
+#if !defined(__ARM_NEON)
+    pool_shutdown();
+#endif
 }
 
 void Search::set_threads(int n) {
     stop();
     wait();
+#if !defined(__ARM_NEON)
+    pool_shutdown();  // retire the old pool before resizing
+#endif
 
     n = std::clamp(n, 1, kMaxThreads);
     workers_.clear();
     workers_.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) workers_.push_back(std::make_unique<Worker>(*this, i));
+#if !defined(__ARM_NEON)
+    pool_spawn();     // one long-lived thread per worker, parked on the start CV
+#endif
 }
 
 void Search::start(const Board& root, const SearchLimits& limits) {
@@ -227,14 +237,24 @@ void Search::start(const Board& root, const SearchLimits& limits) {
 
     for (auto& w : workers_) w->new_search();
     tt_.new_search();
+    syzygy::reset_hits();
 
     width_.store(0, std::memory_order_relaxed);  // every search opens at full depth-focus
     pondering_.store(limits.ponder, std::memory_order_release);  // search free until ponderhit
     stop_.store(false, std::memory_order_release);
     searching_.store(true, std::memory_order_release);
 
-    threads_.reserve(workers_.size());
+#if defined(__ARM_NEON)
+    threads_.reserve(workers_.size());   // pre-F1: one fresh std::thread per worker per `go`
     for (auto& w : workers_) threads_.emplace_back([worker = w.get()] { worker->think(); });
+#else
+    {
+        std::lock_guard<std::mutex> lk(pool_mu_);
+        pool_active_ = static_cast<int>(workers_.size());
+        std::fill(pool_go_.begin(), pool_go_.end(), static_cast<char>(1));
+    }
+    pool_start_cv_.notify_all();   // release the parked pool; wait() blocks on completion
+#endif
 }
 
 void Search::stop() { stop_.store(true, std::memory_order_release); }
@@ -250,9 +270,51 @@ void Search::ponderhit() {
 }
 
 void Search::wait() {
+#if defined(__ARM_NEON)
     for (auto& t : threads_)
         if (t.joinable()) t.join();
     threads_.clear();
+#else
+    std::unique_lock<std::mutex> lk(pool_mu_);
+    pool_done_cv_.wait(lk, [this] { return pool_active_ == 0; });
+#endif
+}
+
+void Search::pool_spawn() {
+    pool_quit_   = false;
+    pool_active_ = 0;
+    pool_go_.assign(workers_.size(), static_cast<char>(0));
+    threads_.reserve(workers_.size());
+    for (std::size_t i = 0; i < workers_.size(); ++i)
+        threads_.emplace_back([this, i] { pool_loop(static_cast<int>(i)); });
+}
+
+void Search::pool_shutdown() noexcept {
+    {
+        std::lock_guard<std::mutex> lk(pool_mu_);
+        pool_quit_ = true;
+    }
+    pool_start_cv_.notify_all();
+    for (auto& th : threads_)
+        if (th.joinable()) th.join();
+    threads_.clear();
+}
+
+void Search::pool_loop(int id) {
+    const std::size_t k = static_cast<std::size_t>(id);
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(pool_mu_);
+            pool_start_cv_.wait(lk, [this, k] { return pool_go_[k] != 0 || pool_quit_; });
+            if (pool_quit_) return;
+            pool_go_[k] = 0;
+        }
+        workers_[k]->think();
+        {
+            std::lock_guard<std::mutex> lk(pool_mu_);
+            if (--pool_active_ == 0) pool_done_cv_.notify_all();
+        }
+    }
 }
 
 void Search::new_game() {
@@ -388,7 +450,16 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
                     continue;
                 }
                 // Losing captures are almost never the refutation at the horizon.
-                if (!see::see_ge(board, m, 0)) continue;
+                // The picker already evaluated see_ge(m, 0) for the captures it scored; only the
+                // TT move / promotions (verdict 0) still pay for the SEE here.
+#if defined(__ARM_NEON)
+                if (!see::see_ge(board, m, 0)) continue;   // pre-E3: SEE recomputed here
+#else
+                {
+                    const int ks = picker.last_see();
+                    if (ks < 0 || (ks == 0 && !see::see_ge(board, m, 0))) continue;
+                }
+#endif
             } else if (move_count > 2 && is_quiet(board, m)) {
                 // Cap the quiet-evasion explosion once a non-mating line exists.
                 break;
@@ -399,9 +470,13 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
         ss->moved_piece  = static_cast<int>(board.at(m.from()));
         ss->moved_to     = m.to().index();
 
+        // D3: prefetch the child's TT cluster BEFORE the NNUE update so the accumulator
+        // work hides the miss (issued after makeMove it led the probe by only a few ns).
+        // zobristAfter() is the library's exact post-move key for the makeMove<false>
+        // the search uses (same en-passant rule); a prefetch cannot change any result.
+        pool_.tt_.prefetch(board.zobristAfter(m));
         nnue::acc_make(board, m);
         board.makeMove(m);
-        pool_.tt_.prefetch(board.hash());
         const Value score = -qsearch(board, ss + 1, -beta, -alpha);
         board.unmakeMove(m);
         nnue::acc_unmake();
@@ -489,9 +564,33 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             return tt_value;
     }
 
+    // ---- Syzygy tablebase probe ----
+    // A small, quiet node (few enough men, no castling rights, halfmove clock 0)
+    // has an exact WDL verdict; a hit is a cutoff. Entirely inert unless tables
+    // are loaded (probe_limit() == 0 disables the gate). Skipped in check and in a
+    // singular verification search. The score is not cached in the TT: it is
+    // ply-encoded for this node, and re-probing on a transposition is cheap.
+    if constexpr (SC_SYZYGY) {
+        // E5: with no tables probe_limit() is 0, so test it FIRST and skip the popcount
+        // and the probe-depth read on every node (pure operands, identical outcome).
+        const int tb_limit = syzygy::probe_limit();
+        if (tb_limit > 0 && !root && !in_check && excluded == Move(Move::NO_MOVE) &&
+            depth >= syzygy::probe_depth() &&
+            static_cast<int>(board.occ().count()) <= tb_limit) {
+            if (const std::optional<Value> tb = syzygy::probe_wdl(board, ss->ply); tb)
+                return *tb;
+        }
+    }
+
     // ---- Static evaluation ----
     const int stm      = static_cast<int>(board.sideToMove());
-    const int corr_idx = pawn_corr_index(board);
+    // E9a: both readers of corr_idx (the eval correction below and the tail update)
+    // sit behind !in_check, so skip the splitmix hash on in-check nodes.
+#if defined(__ARM_NEON)
+    const int corr_idx = pawn_corr_index(board);   // pre-E9a: hashed on in-check nodes too
+#else
+    const int corr_idx = in_check ? 0 : pawn_corr_index(board);
+#endif
     Value raw_eval = VALUE_NONE;  // pure static eval — this is what goes into the TT
     Value eval     = VALUE_NONE;  // corrected + possibly TT-sharpened — drives pruning
     if (!in_check) {
@@ -551,6 +650,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             ss->moved_piece  = 12;
             ss->moved_to     = 0;
 
+            pool_.tt_.prefetch(board.zobristAfter(Move(Move::NULL_MOVE)));  // D3b: null child
             nnue::acc_make_null();
             board.makeNullMove();
             const Value v = -negamax(board, ss + 1, depth - R, -beta, -beta + 1, !cut_node);
@@ -582,9 +682,9 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 ss->moved_piece  = static_cast<int>(board.at(pm.from()));
                 ss->moved_to     = pm.to().index();
 
+                pool_.tt_.prefetch(board.zobristAfter(pm));
                 nnue::acc_make(board, pm);
                 board.makeMove(pm);
-                pool_.tt_.prefetch(board.hash());
                 Value v = -qsearch(board, ss + 1, -probcut_beta, -probcut_beta + 1);
                 if (v >= probcut_beta && !pool_.stop_.load(std::memory_order_relaxed))
                     v = -negamax(board, ss + 1, depth - 4, -probcut_beta, -probcut_beta + 1,
@@ -634,7 +734,15 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
 
         const bool quiet       = is_quiet(board, m);
         const bool capture     = board.isCapture(m);
-        const bool gives_check = board.givesCheck(m) != chess::CheckType::NO_CHECK;
+        // E4: givesCheck is a magic-lookup predicate computed for EVERY move here, but only
+        // quiets read it before pruning (futility) and only surviving moves read it at LMR.
+        // Memoise it and evaluate it lazily, so moves pruned by LMP/SEE never pay for it.
+        int  gives_check_memo = -1;
+        auto gives_check      = [&]() -> bool {
+            if (gives_check_memo < 0)
+                gives_check_memo = (board.givesCheck(m) != chess::CheckType::NO_CHECK) ? 1 : 0;
+            return gives_check_memo != 0;
+        };
 
         ++move_count;
 
@@ -652,8 +760,8 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 // proportionally deeper deficit before giving up on quiets.
                 int fut_margin = kFutilityBase + kFutilityPerDepth * depth;
                 fut_margin += fut_margin * width_ / 256;
-                if (!in_check && !gives_check && depth <= kFutilityMaxDepth &&
-                    ss->static_eval + fut_margin <= alpha)
+                if (!in_check && depth <= kFutilityMaxDepth &&
+                    ss->static_eval + fut_margin <= alpha && !gives_check())
                     skip_quiets = true;
 
                 if (skip_quiets) continue;
@@ -664,7 +772,14 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                     continue;
             } else {
                 // SEE: skip clearly losing captures at shallow depth.
+                // A capture the picker classified good (see_ge(m, 0) held) trivially passes any
+                // threshold <= 0 -- see_ge is monotone in the threshold -- so only bad or
+                // unclassified captures pay for this SEE.
+#if defined(__ARM_NEON)
                 if (depth <= kSeeGateMaxDepth &&
+#else
+                if (depth <= kSeeGateMaxDepth && picker.last_see() <= 0 &&
+#endif
                     !see::see_ge(board, m, -kSeeCaptureMargin * depth))
                     continue;
             }
@@ -703,9 +818,16 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         const std::uint64_t nodes_before =
             root ? nodes_.load(std::memory_order_relaxed) : 0;
 
+        // Resolve givesCheck on the PARENT position for every move that is actually
+        // searched (the LMR term below runs after makeMove and must not re-query).
+        const bool gives_check_now = gives_check();
+        // D3: prefetch the child's TT cluster BEFORE the NNUE update so the accumulator
+        // work hides the miss (issued after makeMove it led the probe by only a few ns).
+        // zobristAfter() is the library's exact post-move key for the makeMove<false>
+        // the search uses (same en-passant rule); a prefetch cannot change any result.
+        pool_.tt_.prefetch(board.zobristAfter(m));
         nnue::acc_make(board, m);
         board.makeMove(m);
-        pool_.tt_.prefetch(board.hash());
 
         // ---- PVS + late move reductions ----
         Value score = -VALUE_INFINITE;
@@ -715,7 +837,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             r += !improving;
             r += 2 * cut_node;
             r -= pv_node;
-            r -= gives_check;
+            r -= gives_check_now;
             if (!quiet)
                 r -= 1;  // reduce tactical moves less
             else
@@ -844,17 +966,21 @@ void Worker::update_stats(const Board& board, Stack* ss, Move best_move, Depth d
     const int bonus = std::min(160 * depth - 90, 1700);
     const int stm   = static_cast<int>(board.sideToMove());
 
+    // E6: the two continuation rows are fixed for this node; resolve them once instead
+    // of per bumped quiet (same entries updated in the same order).
+    std::int16_t (*cont_rows[2])[64] = {nullptr, nullptr};
+    for (int off = 1; off <= 2; ++off) {
+        const Stack* prev = ss - off;
+        if (prev->moved_piece < 12)
+            cont_rows[off - 1] = history_.cont->v[prev->moved_piece][prev->moved_to];
+    }
+
     // Bump one quiet move's butterfly + continuation entries by `b`.
     auto bump_quiet = [&](Move m, int b) {
         history_update(history_.main[stm][m.from().index()][m.to().index()], b);
         const int piece = static_cast<int>(board.at(m.from()));
-        for (int off = 1; off <= 2; ++off) {
-            const Stack* prev = ss - off;
-            if (prev->moved_piece < 12)
-                history_update(history_.cont_entry(prev->moved_piece, prev->moved_to, piece,
-                                                   m.to().index()),
-                               b);
-        }
+        for (int k = 0; k < 2; ++k)
+            if (cont_rows[k]) history_update(cont_rows[k][piece][m.to().index()], b);
     };
 
     auto bump_capture = [&](Move m, int b) {
@@ -1137,8 +1263,8 @@ void Worker::report(Depth depth, Value score) {
         ss << "cp " << clean;
     }
 
-    ss << " nodes " << nodes << " nps " << nps << " time " << ms << " hashfull "
-       << pool_.tt_.hashfull();
+    ss << " nodes " << nodes << " nps " << nps << " time " << ms << " tbhits "
+       << syzygy::hits() << " hashfull " << pool_.tt_.hashfull();
 
     const std::string pv = pv_string();
     if (!pv.empty()) ss << " pv " << pv;

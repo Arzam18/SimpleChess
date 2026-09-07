@@ -17,15 +17,16 @@
 #include <vector>
 
 #include "nnue.hpp"
+#include "syzygy.hpp"
 
 namespace engine {
 
 // Networks live next to the binary / in nets/ and are named
 //   SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5
 // (engine MAJOR + export/quant date, year-month-day so names sort
-// chronologically). This engine plays a *threats* net (FullThreats+PP_3Wide)
-// whose quantised SIMD format is ".scn5" (int8 feature transformer, magic
-// "SCN5") -- NOT the stock ".scn3" (magic "SCN3", which nnue::load() rejects).
+// chronologically). The playing net is the quantised int8 SIMD format ".scn5"
+// (magic "SCN5"); the pre-3.0 ".scn3" format (magic "SCN3", no threat features)
+// is rejected by nnue::load().
 //
 // MAJOR encodes format compatibility (a MAJOR bump is an architecture/format
 // change); retraining a net does NOT bump the version, so within a MAJOR nets
@@ -147,6 +148,17 @@ void UCI::handle_uci() const {
     std::cout << "option name EvalFile type string default SCNNUEv"
               << kNetMajor << "-<YYYY-MM-DD>.scn5\n";
     std::cout << "option name RootNoise type spin default 0 min 0 max 200\n";
+    std::cout << "option name SyzygyPath type string default <empty>\n";
+    std::cout << "option name SyzygyProbeDepth type spin default 1 min 1 max 100\n";
+    std::cout << "option name SyzygyProbeLimit type spin default 7 min 0 max 7\n";
+    std::cout << "option name Syzygy50MoveRule type check default true\n";
+#ifdef SC_BUILD_TAG
+    // Dev/campaign builds only (-DSC_BUILD_TAG=<tag>): lets a benchmark harness
+    // prove which -D set produced this binary. Absent from release builds.
+#define SC_STR_(x) #x
+#define SC_STR(x) SC_STR_(x)
+    std::cout << "option name BuildTag type string default " << SC_STR(SC_BUILD_TAG) << "\n";
+#endif
     std::cout << "uciok" << std::endl;
 }
 
@@ -218,6 +230,20 @@ void UCI::handle_setoption(std::istringstream& is) {
         const int cp = std::clamp(std::stoi(value), 0, 200);
         set_root_noise(cp);
         std::cout << "info string RootNoise = " << cp << " cp" << std::endl;
+    } else if (iequals(name, "SyzygyPath")) {
+        // Load Syzygy tablebases on demand (like EvalFile/Book File). An empty or
+        // failing path leaves probing disabled — a normal state.
+        const int men = syzygy::init(value);
+        if (men > 0)
+            std::cout << "info string Syzygy: " << men << "-man tablebases loaded" << std::endl;
+        else
+            std::cout << "info string Syzygy: no tablebases loaded" << std::endl;
+    } else if (iequals(name, "SyzygyProbeDepth")) {
+        syzygy::set_probe_depth(std::clamp(std::stoi(value), 1, 100));
+    } else if (iequals(name, "SyzygyProbeLimit")) {
+        syzygy::set_probe_limit(std::clamp(std::stoi(value), 0, 7));
+    } else if (iequals(name, "Syzygy50MoveRule")) {
+        syzygy::set_fifty_rule(iequals(value, "true") || value == "1");
     }
     // Unknown options are silently ignored per the protocol.
 }
@@ -308,7 +334,7 @@ void UCI::handle_gengame(std::istringstream& is) {
     // gengame <depth> <maxplies> <fen...>
     // Plays a full game internally from <fen>, greedy (bestmove) each ply, and
     // streams "genply <uci> <cp X|mate Y>" per non-terminal ply, then "genend".
-    // Each ply is a fixed-depth search identical to selfplay.py's per-ply analyse
+    // Each ply is a fixed-depth search identical to the self-play generator's per-ply analyse
     // (single thread, TT carried across plies, RootNoise 0) -> same moves+scores,
     // so Python rebuilds byte-identical training records without per-ply UCI cost.
     int depth = 8, maxplies = 300;
@@ -398,6 +424,7 @@ void UCI::loop() {
         } else if (command == "quit" || command == "exit") {
             search_.stop();
             search_.wait();
+            syzygy::teardown();
             break;
         }
         // Unknown commands are ignored, as required by the protocol.

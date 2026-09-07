@@ -110,6 +110,10 @@ class TranspositionTable {
 
     Cluster*     clusters_      = nullptr;
     std::size_t  cluster_count_ = 0;
+#if defined(_WIN32)
+    std::size_t  alloc_bytes_   = 0;      // VirtualAlloc reservation size (for VirtualFree)
+    bool         large_pages_   = false;  // clusters_ came from MEM_LARGE_PAGES
+#endif
     std::uint8_t generation_    = 0;  // low 5 bits are the current search age
 };
 

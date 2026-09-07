@@ -14,6 +14,50 @@
 #include <algorithm>
 #include <cstring>
 
+// D1: back the transposition table with 2 MB large pages when the OS allows it. Large
+// pages cut TLB misses on the table's random-access probes; the stored bytes and every
+// search result are unchanged, so this is bit-identical. Falls back silently to the
+// 64-B-aligned operator new when large pages are unavailable (privilege absent, feature
+// off, or the reservation fails). Windows-only; other platforms keep operator new.
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+namespace {
+bool sc_enable_lock_pages() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
+        return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount           = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    bool ok = LookupPrivilegeValue(nullptr, SE_LOCK_MEMORY_NAME, &tp.Privileges[0].Luid) &&
+              AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) &&
+              GetLastError() == ERROR_SUCCESS;
+    CloseHandle(tok);
+    return ok;
+}
+// Allocate `bytes` on large pages, or return nullptr. On success `*out_bytes` is the
+// rounded-up reservation size that VirtualFree does not actually need but we keep for
+// bookkeeping/logging. The privilege is enabled once per process.
+void* sc_large_alloc(std::size_t bytes, std::size_t* out_bytes) {
+    static const bool priv = sc_enable_lock_pages();
+    if (!priv) return nullptr;
+    const std::size_t gran = GetLargePageMinimum();
+    if (gran == 0) return nullptr;
+    const std::size_t rounded = ((bytes + gran - 1) / gran) * gran;
+    void* p = VirtualAlloc(nullptr, rounded, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                           PAGE_READWRITE);
+    if (p) *out_bytes = rounded;
+    return p;
+}
+}  // namespace
+#endif  // _WIN32
+
 namespace engine {
 
 namespace {
@@ -39,7 +83,17 @@ Value value_to_tt(Value v, int ply) {
 
 void TranspositionTable::release() noexcept {
     if (clusters_) {
+#if defined(_WIN32)
+        if (large_pages_) {
+            VirtualFree(clusters_, 0, MEM_RELEASE);
+        } else {
+            ::operator delete(clusters_, std::align_val_t{64});
+        }
+        large_pages_ = false;
+        alloc_bytes_ = 0;
+#else
         ::operator delete(clusters_, std::align_val_t{64});
+#endif
         clusters_ = nullptr;
     }
     cluster_count_ = 0;
@@ -53,8 +107,21 @@ void TranspositionTable::resize(std::size_t mb) {
 
     // Cache-line-aligned so no cluster straddles a line; raw allocation (entries
     // are trivial and made valid by the zero-fill in clear()).
+#if defined(_WIN32)
+    const std::size_t need = cluster_count_ * sizeof(Cluster);
+    void* lp = sc_large_alloc(need, &alloc_bytes_);
+    if (lp) {
+        clusters_    = static_cast<Cluster*>(lp);   // MEM_COMMIT zero-fills; clear() re-zeros
+        large_pages_ = true;
+    } else {
+        clusters_    = static_cast<Cluster*>(
+            ::operator new(cluster_count_ * sizeof(Cluster), std::align_val_t{64}));
+        large_pages_ = false;
+    }
+#else
     clusters_ = static_cast<Cluster*>(
         ::operator new(cluster_count_ * sizeof(Cluster), std::align_val_t{64}));
+#endif
     clear();
 }
 
