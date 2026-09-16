@@ -71,7 +71,20 @@ jobs:
           make \
             CXX="${{ steps.find-clang.outputs.toolchain_bin }}/aarch64-linux-android24-clang++" \
             ARCH="-march=armv8-a" \
+            LDFLAGS="-flto -pthread -static" \
             -j"$(nproc)"
+
+      # DroidFish executes the engine binary directly with no ability to set
+      # LD_LIBRARY_PATH, so a binary dynamically linked against libc++_shared.so (the NDK
+      # default) fails to run on-device with no useful error -- DroidFish just reports
+      # "failed to run engine". -static above should eliminate that; confirm here by
+      # checking the ELF dynamic section for any remaining NEEDED shared-library entries.
+      - name: Confirm binary has no shared library dependencies
+        run: |
+          BIN="${{ steps.locate-makefile.outputs.makefile_dir }}/simplechess"
+          file "$BIN"
+          echo "--- Dynamic section (should show no NEEDED entries for a static binary) ---"
+          readelf -d "$BIN" || echo "readelf reports no dynamic section -- fully static, good"
 
       - name: Locate built binary
         run: |
