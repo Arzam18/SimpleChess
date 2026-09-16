@@ -1,0 +1,94 @@
+name: Build Simple Chess for Android
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Locate the Makefile by content rather than assuming its path, same approach used for
+      # Halogen after a wrong-file mixup there. PGO_WORKLOAD is a variable name unique to this
+      # project's Makefile.
+      - name: Locate Simple Chess Makefile
+        id: locate-makefile
+        run: |
+          echo "All Makefiles found in repo:"
+          find . -iname "Makefile"
+          echo "---"
+          MAKEFILE_PATH=$(grep -rl "PGO_WORKLOAD" --include="Makefile" . | head -n1)
+          if [ -z "$MAKEFILE_PATH" ]; then
+            echo "ERROR: no Makefile containing 'PGO_WORKLOAD' was found."
+            exit 1
+          fi
+          echo "Using Makefile: $MAKEFILE_PATH"
+          MAKEFILE_DIR=$(dirname "$MAKEFILE_PATH")
+          echo "makefile_dir=$MAKEFILE_DIR" >> "$GITHUB_OUTPUT"
+
+      # VERSION is a hard prerequisite of every object file in this Makefile (not just a
+      # shell fallback) -- if it's missing, `make` fails with "No rule to make target
+      # 'VERSION'" before a single file compiles.
+      - name: Confirm VERSION file is present
+        run: |
+          cd "${{ steps.locate-makefile.outputs.makefile_dir }}"
+          if [ -f VERSION ]; then
+            echo "VERSION file found: $(cat VERSION)"
+          else
+            echo "VERSION file missing -- creating it as 3.2.0"
+            echo "3.2.0" > VERSION
+          fi
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      # Diagnostic: confirm the exact target-triple cross-compiler exists before pointing
+      # CXX at it directly.
+      - name: Locate NDK aarch64 clang++
+        id: find-clang
+        run: |
+          TOOLCHAIN_BIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "toolchain_bin=$TOOLCHAIN_BIN" >> "$GITHUB_OUTPUT"
+          ls "$TOOLCHAIN_BIN" | grep "aarch64-linux-android24-clang++"
+          "$TOOLCHAIN_BIN/aarch64-linux-android24-clang++" --version
+
+      - name: Build Simple Chess (arm64, armv8-a)
+        run: |
+          cd "${{ steps.locate-makefile.outputs.makefile_dir }}"
+          make \
+            CXX="${{ steps.find-clang.outputs.toolchain_bin }}/aarch64-linux-android24-clang++" \
+            ARCH="-march=armv8-a" \
+            -j"$(nproc)"
+
+      - name: Locate built binary
+        run: |
+          find "${{ steps.locate-makefile.outputs.makefile_dir }}" -maxdepth 1 -iname "simplechess*" -type f
+          file "${{ steps.locate-makefile.outputs.makefile_dir }}/simplechess" || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simplechess-android-arm64
+          path: ${{ steps.locate-makefile.outputs.makefile_dir }}/simplechess
+          if-no-files-found: error
+
+      - name: Create prerelease
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-build-${{ github.run_number }}
+          name: Simple Chess Android build ${{ github.run_number }}
+          prerelease: true
+          files: ${{ steps.locate-makefile.outputs.makefile_dir }}/simplechess
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
