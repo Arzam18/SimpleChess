@@ -26,8 +26,8 @@ namespace engine {
 
 namespace {
 // Safety margin (ms) subtracted from any allotment to cover GUI/network lag and
-// the cost of actually emitting the move.
-constexpr double kMoveOverhead = 30.0;
+// the cost of actually emitting the move: the UCI `Move Overhead` option, carried in
+// SearchLimits::move_overhead_ms (default 30). Read per call below, never hard-coded.
 
 // Project-level hard ceiling on a single move: never more than 60 s, and never
 // more than this fraction of the remaining clock — whichever is smaller.
@@ -60,7 +60,7 @@ TimeBudget compute_budget(const SearchLimits& limits, Color stm, int game_ply) {
     // Fixed move time: spend (almost) all of it, both thresholds equal.
     if (limits.movetime > 0) {
         const std::int64_t t =
-            std::max<std::int64_t>(1, limits.movetime - static_cast<std::int64_t>(kMoveOverhead));
+            std::max<std::int64_t>(1, limits.movetime - static_cast<std::int64_t>(limits.move_overhead_ms));
         budget.soft_ms = t;
         budget.hard_ms = t;
         return budget;
@@ -69,6 +69,7 @@ TimeBudget compute_budget(const SearchLimits& limits, Color stm, int game_ply) {
     const int    us        = static_cast<int>(stm);
     const double time_left = static_cast<double>(limits.time[us]);
     const double inc       = static_cast<double>(limits.inc[us]);
+    const double overhead  = static_cast<double>(limits.move_overhead_ms);
 
     // Degenerate/absent clock: fall back to a tiny fixed think so we still move.
     if (time_left <= 0.0) {
@@ -84,7 +85,7 @@ TimeBudget compute_budget(const SearchLimits& limits, Color stm, int game_ply) {
     // Effective time we may plan to consume before the next control, keeping a
     // per-move overhead in reserve for every move until then.
     const double time_for_control =
-        std::max(1.0, time_left + inc * (mtg - 1) - kMoveOverhead * (2 + mtg));
+        std::max(1.0, time_left + inc * (mtg - 1) - overhead * (2 + mtg));
 
     double opt_scale, max_scale;
 
@@ -113,7 +114,7 @@ TimeBudget compute_budget(const SearchLimits& limits, Color stm, int game_ply) {
 
     double optimum = std::max(1.0, opt_scale * time_for_control);
     double maximum =
-        std::max(optimum, std::min(0.8097 * time_left - kMoveOverhead, max_scale * optimum));
+        std::max(optimum, std::min(0.8097 * time_left - overhead, max_scale * optimum));
 
     // ---- Project hard cap: <= min(60s, fraction of remaining) ----
     const double cap = std::min(kMaxMoveMs,

@@ -4,6 +4,239 @@ Release history for SimpleChess. An entry is added here whenever a tested candid
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.2.0 — 2026-09-16
+
+- Self-reports: `SimpleChess 3.2.0`
+- Source VERSION at save time: `3.2.0`
+
+**At a glance** (numbers only; full method in the sections below):
+
+- 3.1.0 -> 3.2.0: **+34 Elo** [+26, +41] at 10+0.1 -- the gain is the net retrain; the code is at parity at fast TC.
+- E6 correction-history tension weighting **+3.5 Elo**; adaptive-width endgame fix **+3 Elo**.
+- Estimated **CCRL Blitz 2'+1" (1-CPU): 3529** (95% interval 3501-3557) -- our estimate, not a CCRL rating.
+
+### Correction history weighted by pass-eval tension (E6)
+
+The net is queried a second time with the two
+perspectives swapped, giving P, our static score if we had to pass; T = E - P is the static value of
+having the move. A phase-controlled diagnostic over 19,529 positions showed that the residual
+`search - static` is not only larger where T is high but also MORE consistent within a pawn-structure
+key (intraclass correlation 0.55 -> 0.60 across tension quintiles), so the correction table now takes a
+larger step there: the update bonus is scaled by `1 + tn * 16/4096` at nodes of depth >= 6, where
+`tn = clamp(T - 45, 0, 1151)`. Measured +3.5 Elo [-1.7, +8.7], likelihood of superiority 90.4%, over
+6,000 games at 10+0.1 against the bit-identical control; the SPRT did not certify it (LLR +0.70 at the
+3,000-pair backstop); it ships on the positive point estimate. The other six pass-eval plug
+points (reverse futility / razoring margins, LMR, null move, quiescence stand-pat, time management) were
+tested and stripped; their code stays compiled in behind `Pass*` tunables that default to 0 and are
+inert.
+
+### Adaptive search width no longer narrows with material
+
+The continuous width that scales the late-move
+reductions, late-move pruning and futility margins carried a phase factor, `clamp(root_phase - 12, 0, 12)`,
+that fell to zero from a queen-and-rook ending onward, so the engine ran its narrowest tree exactly where
+lines are most forcing: it would reach depth 40+ in seconds while its move stopped changing before depth 30,
+and sit on a mate-in-3 for half a minute. Neither Stockfish nor Reckless scales width by material at all.
+The factor is removed; the width is now the root-gap x score signal only. Measured +3 Elo [-1, +8],
+likelihood of superiority 92.3% over 6,000 games at 10+0.1 (the GSPRT did not certify it, LLR +0.86); kept
+because it is neutral-to-positive and fixes the endgame pathology the campaign was about. Five other search
+changes tried in the same campaign - the pawn-only-endgame prune-off, TB/mate-band prune guards,
+never-LMP-a-check, a seek-mate mode, and an LMR clamp with re-search - each lost its SPRT and were dropped.
+
+### Net vs. code isolation
+
+The 3.1.0 -> 3.2.0 strength gain is the net retrain; the two code changes above are at parity at fast
+time control (short-TC parity, below). Two SPRT
+tests at 10+0.1, `tools/match/pmatch_tc.py`, Threads 1, Hash 256, book `8moves_v3.suite`, seed 42, paired
+openings, each engine's own net swapped in via `--set-a`/`--set-b EvalFile=`:
+
+- **Code only** (net held at the September net, `SCNNUEv3-2026-09-12.scn5`, on both sides): 3.2.0 code
+  vs 3.1.0 code, +0 Elo (+0 [-8,+9], LLR -0.08, 1332 games).
+- **Combined** (3.2.0 code + September net vs 3.1.0 code + August net, the actual shipped gap): +34 Elo
+  [+26,+41], LLR +4.89, LOS 100%, 5526 games.
+
+### Short-TC parity: depth vs. width
+
+The code-only +0 is expected, not a null result. The width change trades a little search depth for width,
+and that extra breadth in low-material positions needs time to convert; at 10+0.1 the depth given up and the
+width gained roughly cancel, so the code reads as parity. The gain is expected to show at the longer controls
+the search is tuned for (2'+1" and up), where there is time for the wider endgame tree to pay off, rather than
+costing anything at fast TC.
+
+### Move Overhead honoured
+
+Time management now honours the `Move Overhead` option. It was parsed since 1.x but the budget used a
+hard-coded 30 ms reserve, so a GUI asking for more (lichess-bot sets 100 ms; phone GUIs need more)
+was silently ignored. The reserve now flows through `SearchLimits::move_overhead_ms` into the
+fixed-movetime path, the per-move clock reserve and the maximum clamp. Default 30 ms: every search
+at the default is unchanged (fixed-depth identity 28/28); at 500 ms a 2000 ms movetime spends
+1500 ms and a 60 s clock budget shrinks from 1272 to 820 ms on the same position.
+
+### Chess960 / FRC / DFRC
+
+`UCI_Chess960` (check, default false, applied by the next `position`, the
+Stockfish contract). In 960 mode castling is spoken king-to-rook (`e1h1`, `bestmove`, `info pv` and
+`position … moves` alike; the standard `e1g1` spelling is still accepted when unambiguous), FEN castling
+fields may be X-FEN (`KQkq`, outermost rook) or Shredder (`HAha`), and `d` reports Shredder-FEN.
+Asymmetric back ranks (DFRC) need nothing extra. The NNUE and the search are unchanged: castling was
+already encoded king-takes-rook internally, the evaluation reads no castling rights, and standard-chess
+play is bit-identical to 3.1.0 (fixed-depth nodes/score/PV 28/28 on the int8 table and 29/29 on the
+float table, 40/40 self-play games byte-identical in both modes, the `position … moves` path identical).
+
+### Move and FEN validation
+
+`position` now validates every move against the legal-move list (Stockfish's `to_move`): an illegal or
+misspelled token is reported with `info string` and the rest of the list is ignored; an unparseable FEN
+(including a king-less one) leaves the position unchanged instead of crashing later.
+
+### Move generation: double-check counting fix
+
+The vendored chess-library mis-counted double checks given by two diagonal sliders (and by
+two pawns or two knights, which only random positions produce), generating interpositions that leave a check
+standing; the engine could then play an illegal move or crash. Fixed in the vendored header (count checkers);
+verified against python-chess over 1.7M positions.
+
+### `perft` debug command
+
+New debug command `perft <depth>` (bulk-counted, per-root-move counts, `Nodes searched: N`). Verified
+on Stockfish 19's 13 FRC/DFRC perft positions at full depth (Shredder and X-FEN spellings), the classic
+standard set, and all 960 positions of Ethereal's `fischer.epd` (depth 5; 60 at depth 6); engine-vs-
+itself play from FRC and DFRC starts checked move by move with python-chess (every move legal, castling
+king-to-rook, `d` round-trips).
+
+### Self-play is start-position agnostic
+
+The labeler always runs in `UCI_Chess960` mode, so the seed book
+may mix standard and FRC/DFRC positions; labels for standard seeds are byte-identical to 3.1.0's. No
+960 strength claim: the current net was trained on standard data only.
+
+### Strength estimate: CCRL-anchored gauntlet
+
+**SimpleChess 3.2.0 is estimated at 3529 Elo on the CCRL Blitz 2'+1" 1-CPU scale, 95% interval 3501 to 3557.**
+This is our own estimate, not a CCRL rating. CCRL has not tested 3.1.0, the first official x86 build, or 3.2.0, so
+3.2.0 played a gauntlet against 29 engines with published CCRL ratings, and its rating was fitted with BayesElo's
+model while every opponent was held at its CCRL rating. Result: +162 =133 -169 in 464 games (228.5/464, 49.2%)
+against a game-weighted average opponent of 3533; the plain logistic performance over the same games is 3528.
+
+**Anchors.** CCRL Blitz 2'+1" rating list, "complete list" (all engines), computed September 12, 2026 with Bayeselo
+from 2,115,612 games; CCRL conditions: ponder off, general book up to 12 moves, up to 6-piece EGTB, time control
+equivalent to 2'+1" on an Intel i7-4770K. Every anchor is the engine's 1-CPU entry, so every engine, SimpleChess
+included, played at Threads 1. Seven engines whose best-version entry is an 8CPU one were anchored at their 1-CPU
+entry (marked 8CPU* below, with the 8CPU rating for reference). Stockfish 19's rating is from the complete list.
+Each opponent is the exact CCRL-tested version, taken from that engine's official GitHub release as a Windows
+x86-64 build that runs on AVX2 (Stockfish 19's universal build picks its code path by CPU), with the asset size
+checked against the server and the file sha256'd.
+
+**Hardware and build.** Intel Core i7-9700 (8 cores, 8 threads, AVX2 and BMI2, no AVX-512), Windows 11.
+`simplechess-3.2.0-avx2.exe` sha256 `981b2b92650d9f6716c250d73f389b2fc2eb580749379a418e156cb61456f25f`
+(1,227,264 bytes) with `SCNNUEv3-2026-09-12.scn5` sha256
+`1bdd72bc999b4fcdc5b204fa0a0b667b38070c4e5a1cd8c5aa876a59459fff87`.
+
+**Conditions.**
+- Time control 120000 ms + 1000 ms per move (2'+1"), charged by wall clock: each engine's clock loses the real time
+  from `go` to `bestmove`, and a clock below -100 ms after a move loses on time. `ucinewgame` and the
+  `isready`/`readyok` handshake happen before the clock starts. Not scaled to CCRL's i7-4770K reference.
+- One core per game: 8 games at a time on 8 cores, each game's two engines locked to one logical CPU by a Windows
+  job object with a one-CPU affinity limit an engine cannot override, and interleaved there; ponder off, so only
+  one engine thinks at a time. All 464 games ran from one fixed work queue: a core starts the next game the moment
+  its current game ends, so no core waits for another.
+- Threads 1 for every engine (Petrel 4.0, bitbit 1.7 and Maelstrom 3.3.0 are single-threaded and have no Threads
+  option). Hash 256 MB for every engine. Both engines are fresh processes every game, so the hash starts empty.
+- Opening books off: `OwnBook` false for SimpleChess, Koivisto and Texel, the only engines exposing a book option.
+  No tablebase path was set for any engine (every engine's default is empty).
+- No adjudication: no resignation, no draw by agreement, no move limit. A game ends only by checkmate, stalemate,
+  threefold repetition, the fifty-move rule, insufficient material, loss on time, an illegal move, or a crash.
+  Every game was recorded to PGN.
+
+**Openings: UHO.** 16 games per opponent: the same 8 openings for every opponent, each played once with each
+colour. The lines are 8-move (16-ply) UHO openings (Unbalanced Human Openings) from SP-CC's UHO 2024 set, White
+evaluated +1.10 to +1.39: a 14-line subset (5 e4, 5 d4, 2 c4, 2 Nf3) from which 3 e4, 3 d4, 1 c4 and 1 Nf3 lines
+were drawn with a fixed seed (`random.Random(42).sample` within each first-move group). Evaluations are UHO's, in
+centipawns for White.
+
+| # | Line (White to move after 8 moves each) | UHO eval |
+|---|---|---|
+| 1 | 1. e4 e6 2. d4 d5 3. e5 c5 4. c3 Ne7 5. Nf3 Nec6 6. h4 b6 7. h5 h6 8. Rh3 a5 | +1.24 |
+| 2 | 1. e4 e6 2. Qe2 d5 3. exd5 Qxd5 4. Nc3 Qd8 5. b3 Nf6 6. Bb2 Be7 7. O-O-O O-O 8. g4 c5 | +1.17 |
+| 3 | 1. e4 c6 2. d4 d5 3. f3 dxe4 4. fxe4 e5 5. Nf3 Bg4 6. c3 Nf6 7. Bc4 Qc7 8. dxe5 Bxf3 | +1.32 |
+| 4 | 1. d4 d5 2. c4 c6 3. Nf3 Nf6 4. Nc3 dxc4 5. a4 a5 6. Ne5 Na6 7. e4 Be6 8. Bxc4 Bxc4 | +1.35 |
+| 5 | 1. d4 Nf6 2. Bf4 e6 3. e3 c5 4. Nf3 b6 5. Nc3 a6 6. d5 d6 7. dxe6 Bxe6 8. Ng5 d5 | +1.26 |
+| 6 | 1. d4 Nf6 2. c4 c5 3. d5 e6 4. Nc3 exd5 5. cxd5 Bd6 6. Bg5 O-O 7. e3 Re8 8. Bd3 Bf8 | +1.33 |
+| 7 | 1. c4 c6 2. e4 d5 3. e5 dxc4 4. Bxc4 Qd4 5. Qe2 Bg4 6. f3 Bf5 7. g4 Be6 8. Bxe6 fxe6 | +1.34 |
+| 8 | 1. Nf3 d5 2. g3 g6 3. c4 dxc4 4. Na3 e5 5. Nxe5 Bxa3 6. Qa4+ b5 7. Qxa3 Bb7 8. Nf3 Nc6 | +1.25 |
+
+The unbalanced starts show in the colour split: White won 301 games, Black 30, and 133 were drawn (28.7% draws,
+against 46.3% across the CCRL list). SimpleChess scored 78.4% as White (+146 =72 -14) and 20.0% as Black
+(+16 =61 -155).
+
+**Rating method.** BayesElo's model (Remi Coulom, https://www.remi-coulom.fr/Bayesian-Elo/) with its default
+settings, reproduced in a small fitter because BayesElo itself cannot hold 29 players at fixed ratings:
+
+    f(D) = 1 / (1 + 10^(D/400))
+    P(White wins) = f(eloBlack - eloWhite - eloAdvantage + eloDraw)
+    P(Black wins) = f(eloWhite - eloBlack + eloAdvantage + eloDraw)
+    P(draw)       = 1 - P(White wins) - P(Black wins)
+    eloAdvantage = 32.8, eloDraw = 97.3                          (BayesElo defaults)
+
+- Printed scale. BayesElo fits internal ratings and, after `mm`, prints `EloScale * internal + offset`, with
+  `x = 10^(-eloDraw/400)` and `EloScale = 4x / (1+x)^2`, which is 0.9255 at the default eloDraw. CCRL's ratings are
+  printed values, so the internal difference between SimpleChess and opponent j is `(R - anchor_j) / 0.9255`, and R
+  comes out on CCRL's printed scale.
+- Prior. BayesElo's default `prior 2` adds, for each player, `2 * 0.25 / games * games_vs_j` virtual draws per
+  colour against each opponent: one virtual draw in total for SimpleChess, spread over its opponents by games
+  played. The opponents' own share is negligible on CCRL, where each has thousands of games, and is not added.
+- Only R is fitted, by maximum likelihood; the 95% interval is where the log-likelihood is within 1.92 of its
+  maximum. The anchors' own CCRL error bars (+-7 to +-19) are not propagated into it.
+- Fitting eloAdvantage and eloDraw from these games (BayesElo's `mm 1 1`) was tried and rejected: with the anchors
+  on the printed scale, EloScale depends on the fitted eloDraw and the two run away together (16 losses to
+  Stockfish 19 came out at 3741). The fitter was checked by recovering a synthetic engine's rating exactly.
+
+**Results by opponent.** Score and performance are per 16 games; "Elo vs it" is the pentanomial estimate over the 8
+opening pairs, with its 95% interval.
+
+| # | Opponent (CCRL name) | CCRL 1-CPU | W | D | L | Score | Elo vs it (95%) | Perf |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Stockfish 19 | 3784 +-13 | 0 | 6 | 10 | 3/16 | -255 [-359, -179] | 3529 |
+| 2 | PlentyChess 8.0.0 | 3774 +-13 | 2 | 5 | 9 | 4.5/16 | -163 [-266, -81] | 3611 |
+| 3 | Reckless 0.9.0 | 3766 +-11 | 1 | 6 | 9 | 4/16 | -191 [-284, -118] | 3575 |
+| 4 | Viridithas 20.0.0 | 3747 +-12 | 0 | 6 | 10 | 3/16 | -255 [-359, -179] | 3492 |
+| 5 | Alexandria 8.0.0 (8CPU* 3755) | 3722 +-10 | 2 | 5 | 9 | 4.5/16 | -163 [-266, -81] | 3559 |
+| 6 | Halogen 16.0.0 | 3721 +-8 | 1 | 6 | 9 | 4/16 | -191 [-284, -118] | 3530 |
+| 7 | Horsie 1.1.0 (8CPU* 3735) | 3709 +-10 | 0 | 7 | 9 | 3.5/16 | -221 [-286, -167] | 3488 |
+| 8 | Motor 0.9.0 | 3695 +-9 | 3 | 6 | 7 | 6/16 | -89 [-189, -2] | 3606 |
+| 9 | Koivisto 9.0 (8CPU* 3682) | 3632 +-8 | 2 | 6 | 8 | 5/16 | -137 [-203, -80] | 3495 |
+| 10 | Avalanche 4.0.0 | 3597 +-16 | 4 | 4 | 8 | 6/16 | -89 [-215, +17] | 3508 |
+| 11 | Black Marlin 9.0 (8CPU* 3622) | 3590 +-10 | 4 | 4 | 8 | 6/16 | -89 [-157, -27] | 3501 |
+| 12 | Altair 7.0.0 (8CPU* 3632) | 3579 +-10 | 7 | 2 | 7 | 8/16 | 0 [-142, +142] | 3579 |
+| 13 | Elixir 3.0 | 3567 +-10 | 5 | 2 | 9 | 6/16 | -89 [-189, -2] | 3478 |
+| 14 | pawn 4.0 | 3553 +-13 | 6 | 3 | 7 | 7.5/16 | -22 [-96, +51] | 3531 |
+| 15 | Petrel 4.0 | 3537 +-16 | 7 | 2 | 7 | 8/16 | 0 [-61, +61] | 3537 |
+| 16 | Carp 3.0.1 | 3525 +-9 | 6 | 3 | 7 | 7.5/16 | -22 [-96, +51] | 3503 |
+| 17 | Lambergar 1.5 | 3509 +-14 | 8 | 2 | 6 | 9/16 | +44 [-9, +98] | 3553 |
+| 18 | Texel 1.11 (8CPU* 3584) | 3506 +-11 | 8 | 3 | 5 | 9.5/16 | +66 [-119, +305] | 3572 |
+| 19 | Molybdenum 4.1 | 3432 +-10 | 7 | 6 | 3 | 10/16 | +89 [+2, +189] | 3521 |
+| 20 | bitbit 1.7 | 3405 +-15 | 7 | 7 | 2 | 10.5/16 | +112 [+51, +182] | 3517 |
+| 21 | Perseus 1.1 | 3397 +-10 | 8 | 6 | 2 | 11/16 | +137 [+80, +203] | 3534 |
+| 22 | Pea 9.1 | 3383 +-16 | 9 | 6 | 1 | 12/16 | +191 [+118, +284] | 3574 |
+| 23 | Frozenight 6.0.0 | 3362 +-9 | 9 | 5 | 2 | 11.5/16 | +163 [+81, +266] | 3525 |
+| 24 | Xiphos 0.6 (8CPU* 3462) | 3354 +-7 | 8 | 4 | 4 | 10/16 | +89 [-48, +262] | 3443 |
+| 25 | Tunguska 2.1 | 3349 +-19 | 10 | 3 | 3 | 11.5/16 | +163 [+59, +307] | 3512 |
+| 26 | Catalyst 3.1.0 | 3335 +-16 | 10 | 4 | 2 | 12/16 | +191 [+91, +334] | 3526 |
+| 27 | Maelstrom 3.3.0 | 3314 +-12 | 9 | 6 | 1 | 12/16 | +191 [+118, +284] | 3505 |
+| 28 | Mantissa 3.7.2 | 3311 +-9 | 11 | 3 | 2 | 12.5/16 | +221 [+105, +416] | 3532 |
+| 29 | c4ke 3.0 | 3303 +-14 | 8 | 5 | 3 | 10.5/16 | +112 [+51, +182] | 3415 |
+| | **Total** | avg 3533 | **162** | **133** | **169** | **228.5/464** | | **3529 (BayesElo)** |
+
+**How the games ended.** Checkmate 330, threefold repetition 100, fifty-move rule 32, insufficient material 1,
+loss on time 1. SimpleChess never lost on time (its lowest clock in any game was 9.0 s); no engine crashed. Games
+averaged 5.7 minutes; the longest, against bitbit, ran 737 plies after the opening in 14.9 minutes.
+
+**Differences from CCRL testing.** UHO unbalanced openings instead of a general book up to 12 moves (hence far
+fewer draws); no tablebases instead of up to 6-piece EGTB; 2'+1" on an i7-9700 without scaling to CCRL's i7-4770K reference,
+and the i7-9700 is the faster CPU, so every engine searched somewhat more per move than CCRL's scaled time control
+intends; 16 games per opponent, so the
+per-opponent intervals are wide and the estimate's precision comes from all 464 games together.
+
 ## v3.1.0 — 2026-09-07
 
 - Self-reports: `SimpleChess 3.1.0`

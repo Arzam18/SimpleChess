@@ -3819,23 +3819,32 @@ template <Color::underlying c>
 
     const auto opp_pawns = board.pieces(PieceType::PAWN, ~c);
 
+    // SimpleChess local fix (2026-09-08; upstream 0.9.4 master counts checker TYPES, not
+    // checkers): any two checkers -- two knights, two pawns, a diagonal pair, an orthogonal
+    // pair, or any mix -- is a double check and only king moves are legal. Upstream only
+    // handled the orthogonal pair, so e.g. two bishops on two diagonals (reachable in real
+    // games via a discovered check) built the mask from the lower-indexed checker alone and
+    // generated interpositions that leave the other check standing; the king was captured on
+    // the next ply. Random-placement seeds also produce two-pawn / two-knight checks.
     int checks = 0;
 
     // check for knight checks
     Bitboard knight_attacks = attacks::knight(sq) & opp_knight;
-    checks += bool(knight_attacks);
+    checks += knight_attacks.count();
 
     Bitboard mask = knight_attacks;
 
     // check for pawn checks
     Bitboard pawn_attacks = attacks::pawn(board.sideToMove(), sq) & opp_pawns;
     mask |= pawn_attacks;
-    checks += bool(pawn_attacks);
+    checks += pawn_attacks.count();
+    if (checks >= 2) return {mask, 2};
 
     // check for bishop checks
     Bitboard bishop_attacks = attacks::bishop(sq, board.occ()) & (opp_bishop | opp_queen);
 
     if (bishop_attacks) {
+        if (bishop_attacks.count() > 1) return {mask, 2};
         mask |= between(sq, bishop_attacks.lsb());
         checks++;
     }
@@ -3843,14 +3852,12 @@ template <Color::underlying c>
     Bitboard rook_attacks = attacks::rook(sq, board.occ()) & (opp_rook | opp_queen);
 
     if (rook_attacks) {
-        if (rook_attacks.count() > 1) {
-            checks = 2;
-            return {mask, checks};
-        }
-
+        if (rook_attacks.count() > 1) return {mask, 2};
         mask |= between(sq, rook_attacks.lsb());
         checks++;
     }
+
+    if (checks >= 2) return {mask, 2};
 
     if (!mask) {
         return {constants::DEFAULT_CHECKMASK, checks};

@@ -30,6 +30,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <iosfwd>
 #include <thread>
 #include <vector>
 #include <condition_variable>
@@ -48,6 +50,87 @@
 #ifndef SC_DEFAULT_THREADS
 #define SC_DEFAULT_THREADS 8
 #endif
+// Pass-eval tension (dev-notes/NOVELTY_CANDIDATES.md #1; campaign record dev-notes/PASSEVAL.md).
+// 0 = no tension machinery at all, bit-for-bit the pre-campaign engine; 1 = the machinery compiled in
+// and the Pass* UCI tunables exposed. ON BY DEFAULT since 3.2.0 because it carries E6, the one plug
+// point kept: the correction-history update weighted by tension (PassCorrW 16, PassMinDepth 6, PassTau
+// 45, PassCap 1151 -- constants from the phase-controlled F1 diagnostic, +3.5 Elo [-1.7,+8.7] LOS 90.4%
+// over 6000 games at 10+0.1, deployed to lichess-bot 2026-09-11). Every OTHER tunable defaults to 0 and
+// is inert: those plug points were tested and stripped (see PASSEVAL.md), the code stays for the record.
+// SC_PASSEVAL_VERIFY adds the in-search oracle (dev builds only: every T is cross-checked against a real
+// null move).
+#ifndef SC_PASSEVAL
+#define SC_PASSEVAL 1
+#endif
+#ifndef SC_PASSEVAL_VERIFY
+#define SC_PASSEVAL_VERIFY 0
+#endif
+// Compile-time defaults of the tunables (each experiment builds with ITS values as defaults so the
+// PGO profile and the played configuration agree; UCI setoption only serves alternates).
+#ifndef SC_PASS_MINDEPTH
+#define SC_PASS_MINDEPTH 6
+#endif
+#ifndef SC_PASS_TAU
+#define SC_PASS_TAU 45
+#endif
+#ifndef SC_PASS_CAP
+#define SC_PASS_CAP 1151
+#endif
+#ifndef SC_PASS_RAZOR
+#define SC_PASS_RAZOR 0
+#endif
+#ifndef SC_PASS_RFP
+#define SC_PASS_RFP 0
+#endif
+#ifndef SC_PASS_LMRDIV
+#define SC_PASS_LMRDIV 0
+#endif
+#ifndef SC_PASS_NMPMARGIN
+#define SC_PASS_NMPMARGIN 0
+#endif
+#ifndef SC_PASS_ZUG
+#define SC_PASS_ZUG 0
+#endif
+#ifndef SC_PASS_QSLAMBDA
+#define SC_PASS_QSLAMBDA 0
+#endif
+#ifndef SC_PASS_TMSCALE
+#define SC_PASS_TMSCALE 0
+#endif
+#ifndef SC_PASS_CORRW
+#define SC_PASS_CORRW 16
+#endif
+// Item #8: per-move accumulator-delta significance into LMR. SC_ACCSIG compiles the plug in;
+// SC_ACCSIG_DIV 0 keeps it inert, so a candidate build with DIV 0 is identical to the control.
+#ifndef SC_ACCSIG
+#define SC_ACCSIG 0
+#endif
+#ifndef SC_ACCSIG_DIV
+#define SC_ACCSIG_DIV 0
+#endif
+#ifndef SC_ACCSIG_MAX
+#define SC_ACCSIG_MAX 2
+#endif
+// The opposite half of the same signal: reduce a quiet MORE when it barely changes what the net sees.
+// 0 = off. Cheaper by construction than SC_ACCSIG_DIV, because reducing more shrinks the tree where
+// reducing less grows it.
+#ifndef SC_ACCSIG_LOW
+#define SC_ACCSIG_LOW 0
+#endif
+// Minimum node depth at which the accsig plug fires (0 = every LMR node). The relief form's whole
+// problem is the tree it grows, and a depth gate cuts the number of firings far faster than it cuts
+// the effect -- the same trade that took E2-prime from +7.12% to -0.10% time-to-depth.
+#ifndef SC_ACCSIG_MINDEPTH
+#define SC_ACCSIG_MINDEPTH 0
+#endif
+// Item #9: plies of LMR relief for a quiet move that creates at least SC_THRSIG_MIN new attacks on a
+// higher-valued enemy piece. 0 = off.
+#ifndef SC_THRSIG
+#define SC_THRSIG 0
+#endif
+#ifndef SC_THRSIG_MIN
+#define SC_THRSIG_MIN 1
+#endif
 #include "types.hpp"
 
 namespace engine {
@@ -61,6 +144,12 @@ void set_root_noise(int cp);
 // Silence all UCI output (info/bestmove) from the search. Used by the in-engine
 // game generator (`gengame`) so its many per-ply searches don't spam stdout.
 void set_gen_silent(bool silent);
+
+// Pass-eval tunables (inert unless SC_PASSEVAL). set_pass_param returns false for an unknown
+// name (case-insensitive) and clamps to the advertised range; pass_param_options prints the
+// `option name ...` lines (nothing when SC_PASSEVAL == 0).
+bool set_pass_param(std::string_view name, int value);
+void pass_param_options(std::ostream& out);
 
 // Per-ply search state, addressed relative to the current node (ss-1 == parent).
 // The array lives in Worker::think(); a few slots of margin on both sides make
@@ -139,6 +228,12 @@ class Worker {
     // Snapshot of the pool's search width, taken once per ID iteration so the
     // widening is stable within an iteration.
     int width_ = 0;
+
+    // Pass-eval: per-iteration snapshot of the tunables (plain ints in the hot path, one
+    // consistent set per iteration, like width_), and the root's tension for the time manager
+    // (VALUE_NONE until the root node computed it; helpers keep their own copy).
+    std::array<int, 11> pass_{};
+    Value               root_tension_ = VALUE_NONE;
 
     // Triangular PV table: pv_[ply] holds the PV starting at that ply.
     std::array<std::array<Move, MAX_PLY + 1>, MAX_PLY + 1> pv_{};
