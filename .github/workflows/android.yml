@@ -71,19 +71,23 @@ jobs:
           make \
             CXX="${{ steps.find-clang.outputs.toolchain_bin }}/aarch64-linux-android24-clang++" \
             ARCH="-march=armv8-a" \
-            LDFLAGS="-flto -pthread -static" \
+            EXTRA="-fPIE" \
+            LDFLAGS="-flto -pthread -static-pie" \
             -j"$(nproc)"
 
-      # DroidFish executes the engine binary directly with no ability to set
-      # LD_LIBRARY_PATH, so a binary dynamically linked against libc++_shared.so (the NDK
-      # default) fails to run on-device with no useful error -- DroidFish just reports
-      # "failed to run engine". -static above should eliminate that; confirm here by
-      # checking the ELF dynamic section for any remaining NEEDED shared-library entries.
-      - name: Confirm binary has no shared library dependencies
+      # Android's dynamic linker refuses to exec any non-PIE binary since API 21, even a
+      # fully static one -- a plain -static link often produces a traditional (non-PIE)
+      # static executable, which fails to run on-device with the same generic error as a
+      # missing shared library. -static-pie above should produce a PIE-compatible static
+      # binary; confirm the ELF header's Type here (DroidFish needs "DYN" or an
+      # explicitly PIE-flagged EXEC, not a plain non-PIE "EXEC").
+      - name: Confirm binary is PIE and has no shared library dependencies
         run: |
           BIN="${{ steps.locate-makefile.outputs.makefile_dir }}/simplechess"
           file "$BIN"
-          echo "--- Dynamic section (should show no NEEDED entries for a static binary) ---"
+          echo "--- ELF header type ---"
+          readelf -h "$BIN" | grep -i type
+          echo "--- Dynamic section (should show no NEEDED entries) ---"
           readelf -d "$BIN" || echo "readelf reports no dynamic section -- fully static, good"
 
       - name: Locate built binary
