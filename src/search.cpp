@@ -27,7 +27,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdio>
+#include <string_view>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -59,7 +62,57 @@ thread_local std::uint64_t    t_noise_seed{0};   // fixed per search (set in thi
     h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ULL; h ^= h >> 27;
     return static_cast<int>(h % (2ULL * noise + 1ULL)) - noise;
 }
+
+// ---- Pass-eval tension (SC_PASSEVAL) ----
+// P = our static score if we had to pass (nnue::evaluate_pass: the same accumulator read with the
+// perspectives swapped), T = raw eval - P: ~tempo in quiet positions, large when either side has a
+// threat, negative when passing beats moving (zugzwang-like). tn = the excess over the quiet
+// baseline PassTau, capped at PassCap, is what the plug points scale by. Every scale at 0 == that
+// plug point off, so a build with all scales 0 searches identically to SC_PASSEVAL=0 and differs
+// only by the cost of computing T (that is how the cost is measured). Runtime-settable through
+// UCI (masters below); each worker snapshots them once per iteration into Worker::pass_.
+struct PassParamInfo { const char* name; int def, lo, hi; };
+constexpr PassParamInfo kPassParams[] = {
+    {"PassMinDepth",  SC_PASS_MINDEPTH,  1,    20},   // compute T at main-search nodes with depth >= this (1 = every node: cost cliff)
+    {"PassTau",       SC_PASS_TAU,       -200, 500},  // quiet baseline subtracted from T (diagnostic: P50 of T)
+    {"PassCap",       SC_PASS_CAP,       1,    3000}, // cap on tn (diagnostic: P99 of T); >= 1 keeps std::clamp well-formed
+    {"PassRazor",     SC_PASS_RAZOR,     0,    64},   // razor margin += tn * PassRazor / 16  (F1: DROPPED, AUC 0.540)
+    {"PassRfp",       SC_PASS_RFP,       0,    64},   // RFP margin   += tu * PassRfp   / 16  (tu = two-sided)
+    {"PassLmrDiv",    SC_PASS_LMRDIV,    0,    2000}, // r += min(2, tn / PassLmrDiv) on QUIETS only   (0 = off)
+    {"PassNmpMargin", SC_PASS_NMPMARGIN, 0,    2000}, // skip the null search when P_est < beta - margin (0 = off)
+    {"PassZug",       SC_PASS_ZUG,       0,    500},  // skip the null search when T < -PassZug          (0 = off)
+    {"PassQsLambda",  SC_PASS_QSLAMBDA,  0,    64},   // qsearch stand-pat -= tq * PassQsLambda / 64
+    {"PassTmScale",   SC_PASS_TMSCALE,   0,    64},   // soft budget: +ts/256 at tn 0 .. -ts/256 saturated, 1.0 at kPassTmMid
+    {"PassCorrW",     SC_PASS_CORRW,     0,    64},   // corrhist update bonus *= 1 + tn * PassCorrW / 4096  (0 = off)
+};
+enum PassIdx { PASS_MIN_DEPTH, PASS_TAU, PASS_CAP, PASS_RAZOR, PASS_RFP, PASS_LMR_DIV,
+               PASS_NMP_MARGIN, PASS_ZUG, PASS_QS_LAMBDA, PASS_TM_SCALE, PASS_CORR_W, PASS_N };
+static_assert(sizeof(kPassParams) / sizeof(kPassParams[0]) == PASS_N, "kPassParams/PassIdx out of sync");
+static_assert(PASS_N == 11, "Worker::pass_ is sized for 11 tunables");
+std::atomic<int> g_pass[PASS_N];   // UCI-settable masters; workers snapshot them per iteration
+const bool g_pass_init = [] { for (int i = 0; i < PASS_N; ++i) g_pass[i].store(kPassParams[i].def); return true; }();
 }  // namespace
+
+bool set_pass_param(std::string_view name, int value) {
+    for (int i = 0; i < PASS_N; ++i) {
+        const std::string_view n = kPassParams[i].name;
+        if (n.size() == name.size() &&
+            std::equal(n.begin(), n.end(), name.begin(), [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+            })) {
+            g_pass[i].store(std::clamp(value, kPassParams[i].lo, kPassParams[i].hi), std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
+void pass_param_options(std::ostream& out) {
+    if constexpr (SC_PASSEVAL)
+        for (const auto& p : kPassParams)
+            out << "option name " << p.name << " type spin default " << p.def
+                << " min " << p.lo << " max " << p.hi << "\n";
+}
 
 void set_root_noise(int cp) { g_root_noise.store(cp < 0 ? 0 : cp, std::memory_order_relaxed); }
 
@@ -91,6 +144,13 @@ namespace {
 // Margins are in centipawns unless noted. These are sane starting points, not
 // tuned values — SPSA them once the evaluation stabilizes.
 
+// The tn at which the PassTmScale time apportionment leaves the budget unchanged. Started as the
+// median of tn on F1's measured pool (P50(T) 117 - PassTau 45 = 72), but the tn distribution is
+// skewed, so that value left the candidate using +1.89% more mean time than the control -- worth
+// about 1.6 Elo of "thinking longer" at 10+0.1, which against [0,2] bounds could manufacture a
+// false PASS. CALIBRATED instead: tools/verify/passeval_tmcheck.py measures mean time consumed over
+// 300 phase-diverse positions under a real clock, and 88 is the value that makes the ratio 1.000.
+constexpr int   kPassTmMid         = 88;
 constexpr Depth kIIRMinDepth       = 4;    // reduce when no TT move at/above this depth
 constexpr Depth kRazorMaxDepth     = 3;    // razoring applies at depth <= this
 constexpr int   kRazorMargin       = 300;  // per-depth margin below alpha
@@ -142,10 +202,9 @@ constexpr int   kEffortMaxCutPct = 60;  // strongest trim, at a 100% share
 // wide, and when one clearly dominates it should be deep. Concretely, shrink
 // LMR reductions (widening the tree) in unclear positions and grow them on
 // decisive mainlines. The main worker recomputes a width in [0, SC_BREADTH]
-// after each iteration as the product of three fading signals —
+// after each iteration as the product of two fading signals —
 //     gap closeness   (1 at best==2nd best root move .. 0 at >= 80cp apart)
 //   x score closeness (1 at 0.00 .. 0 at |score| >= 200cp: decisive = narrow)
-//   x middlegame-ness (1 at full material .. 0 in the endgame: endings = deep)
 // — and every worker scales its pruning by it: LMR reductions shrink by
 // width/256, LMP move budgets and futility margins grow by width/256. A width
 // of 128 is "one full ply" of widening; 0 prunes bit-identically to v0.6.
@@ -156,8 +215,10 @@ constexpr int   kEffortMaxCutPct = 60;  // strongest trim, at a 100% share
 constexpr int   kBreadthMax        = SC_BREADTH;
 constexpr Value kBreadthGapRange   = 80;   // gap signal fades to 0 here (cp)
 constexpr Value kBreadthScoreRange = 200;  // score signal fades to 0 here (cp)
-constexpr int   kBreadthPhaseMin   = 12;   // phase signal is 0 at/below this material
-constexpr int   kBreadthPhaseSpan  = 12;   // ...and saturates 12 phase points above it
+// The old third factor (middlegame-ness, "endings = deep") was DROPPED in 3.2:
+// it forced width to 0 from ~Q+R each side on, so every endgame ran the
+// narrowest tree — neither Stockfish nor Reckless has any material term in its
+// reductions. See dev-notes/campaigns/search-3.2.
 constexpr Depth kBreadthMinDepth   = 6;    // trust the root gap only from this iteration on
 
 // Late-move-reduction table, indexed [depth][move number]; log-shaped.
@@ -339,6 +400,7 @@ void Worker::new_search() {
     ponder_move_ = Move(Move::NO_MOVE);
     root_second_ = -VALUE_INFINITE;
     root_n_      = 0;
+    root_tension_ = VALUE_NONE;
     pv_len_.fill(0);
 }
 
@@ -412,6 +474,19 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
     } else {
         raw_eval = (probe.hit && tt_eval != VALUE_NONE) ? tt_eval : nnue::evaluate(board);
         best     = raw_eval;
+        if constexpr (SC_PASSEVAL) {
+            // Null-move-consistent stand-pat: P (our eval if we passed) is the conservative bound
+            // on this node, raw_eval the optimistic one; lambda interpolates (0 = today). The net
+            // is queried only where the penalty can change a decision: above alpha, and not so far
+            // above beta that even the maximal penalty (cap * lambda / 64) leaves the cutoff intact
+            // -- at a null window that band is ~cap*lambda/64 cp wide, so the cost stays bounded.
+            const int lam = pass_[PASS_QS_LAMBDA];
+            if (lam > 0 && raw_eval > alpha && raw_eval - pass_[PASS_CAP] * lam / 64 < beta) {
+                const int t  = raw_eval - nnue::evaluate_pass(board);
+                const int tq = std::clamp<int>(t - pass_[PASS_TAU], 0, pass_[PASS_CAP]);
+                best = static_cast<Value>(raw_eval - tq * lam / 64);
+            }
+        }
         // A TT value with the right bound is a tighter estimate than raw eval.
         if (probe.hit && tt_value != VALUE_NONE && bound_covers(tt_bound, tt_value, best))
             best = tt_value;
@@ -615,6 +690,62 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     const bool improving = !in_check && (ss - 2)->static_eval != VALUE_NONE &&
                            ss->static_eval > (ss - 2)->static_eval;
 
+    // ---- Pass-eval tension (SC_PASSEVAL) ----
+    // T = raw static eval minus our static eval if we had to pass. Net-internal on purpose:
+    // raw_eval (fresh, or the TT's stored raw eval of this same position), not the corrected
+    // eval; never in check (the passed position would be illegal). tn = excess over the quiet
+    // baseline, capped: the quantity the plug points scale by. Costs pairwise + L1 + body (no
+    // accumulator work), so it is computed LAZILY, at most once per node, and only when a
+    // decision actually hinges on it: razoring / RFP / NMP can only be vetoed by tension, so they
+    // ask for it once their untensioned condition already says "prune"; LMR asks before the
+    // move loop; the time manager asks at the root. With every scale at 0 nothing is ever
+    // computed and the search is byte-identical to SC_PASSEVAL=0. Gate: the node's nominal depth
+    // >= PassMinDepth (IIR fires only at depth >= 4 and reduces by one).
+    Value tension = VALUE_NONE;
+    int   tn      = 0;
+    // tu = "how over-optimistic is this static eval", the TWO-SIDED asymmetric form RFP needs.
+    // F1 measured frac(R < -100) -- precisely the error reverse futility is exposed to -- by T
+    // decile: it bottoms at 10.0% in the decile T in [15,45], climbs to 32.0% at T >= 418, and ALSO
+    // rises to 15.2% in the T <= 15 tail, with the left slope about 2x the right per centipawn
+    // (+5.2pp over ~80cp going down vs +22pp over ~670cp going up). The one-sided
+    // clamp(T - tau, 0, cap) that tn uses scores that whole left tail as zero.
+    int   tu      = 0;
+    [[maybe_unused]] bool tension_done = false;
+    auto need_tension = [&]() {
+        if constexpr (SC_PASSEVAL) {
+            if (tension_done) return;
+            tension_done = true;
+            if (in_check || depth < pass_[PASS_MIN_DEPTH]) return;
+            const Value p = nnue::evaluate_pass(board);
+            tension = raw_eval - p;
+            tn      = std::clamp<int>(tension - pass_[PASS_TAU], 0, pass_[PASS_CAP]);
+            tu      = std::clamp<int>(tension > pass_[PASS_TAU]
+                                          ? tension - pass_[PASS_TAU]
+                                          : 2 * (pass_[PASS_TAU] - tension),
+                                      0, pass_[PASS_CAP]);
+            if (root) root_tension_ = tension;
+#if SC_PASSEVAL_VERIFY
+            // In-search oracle (dev builds only): P must equal the eval of the actual null-moved
+            // position through the incremental path, and a TT-supplied raw_eval must equal a fresh
+            // query. Any mismatch is a bug, never noise (both are deterministic integer paths).
+            nnue::acc_make_null();
+            board.makeNullMove();
+            const Value p_ref = -nnue::evaluate(board);
+            board.unmakeNullMove();
+            nnue::acc_unmake_null();
+            if (p_ref != p)
+                std::fprintf(stderr, "[passeval] P MISMATCH ply=%d p=%d ref=%d\n", ss->ply, int(p), int(p_ref));
+            if (probe.hit && tt_eval != VALUE_NONE) {
+                const Value fresh = nnue::evaluate(board);
+                if (tt_eval != fresh)
+                    std::fprintf(stderr, "[passeval] TT EVAL MISMATCH ply=%d tt=%d fresh=%d\n", ss->ply, int(tt_eval), int(fresh));
+            }
+#endif
+        }
+    };
+    if constexpr (SC_PASSEVAL)
+        if (root && pass_[PASS_TM_SCALE] > 0) need_tension();   // the time manager reads root_tension_
+
     // ---- Internal iterative reduction ----
     // No TT move at a node that matters means the previous search of this node
     // was shallow or absent; a reduced search will populate one cheaply.
@@ -626,16 +757,33 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         // ---- Razoring ----
         // Hopelessly below alpha at low depth: verify with qsearch and give up.
         if (depth <= kRazorMaxDepth && eval + kRazorMargin * depth < alpha) {
-            const Value v = qsearch(board, ss, alpha - 1, alpha);
-            if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
-            if (v < alpha && !is_mate_score(v)) return v;
+            // Pass-eval veto (SC_PASSEVAL): under tension the deficit must also cover
+            // tn * PassRazor / 16 before the node is given up (T computed here, lazily).
+            if constexpr (SC_PASSEVAL)
+                if (pass_[PASS_RAZOR] > 0) need_tension();
+            if (eval + kRazorMargin * depth + (SC_PASSEVAL ? tn * pass_[PASS_RAZOR] / 16 : 0) < alpha) {
+                const Value v = qsearch(board, ss, alpha - 1, alpha);
+                if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
+                if (v < alpha && !is_mate_score(v)) return v;
+            }
         }
 
         // ---- Reverse futility pruning (static null move) ----
         // So far above beta that a real search is a formality.
         if (depth <= kRFPMaxDepth && !is_mate_score(eval) &&
-            eval - kRFPMargin * (depth - improving) >= beta)
-            return (eval + beta) / 2;
+            eval - kRFPMargin * (depth - improving) >= beta) {
+            // Pass-eval veto (SC_PASSEVAL): the static surplus must also cover tu * PassRfp / 16.
+            // RFP is the ONE plug point F1's signed decomposition supports: it trusts that a high
+            // eval means a cutoff, so it is exposed to OVER-optimism, and tension predicts exactly
+            // that (AUC 0.619, frac(R < -100) climbing 10.0% -> 32.0% across T deciles). Razoring is
+            // exposed to over-PESSIMISM instead, which tension barely predicts (AUC 0.540), so
+            // PassRazor stays 0: E1 scaled both at 8/8 and about half of what it paid bought noise.
+            // Uses tu, the two-sided asymmetric measure, not tn (T computed lazily).
+            if constexpr (SC_PASSEVAL)
+                if (pass_[PASS_RFP] > 0) need_tension();
+            if (eval - kRFPMargin * (depth - improving) - (SC_PASSEVAL ? tu * pass_[PASS_RFP] / 16 : 0) >= beta)
+                return (eval + beta) / 2;
+        }
 
         // ---- Null move pruning ----
         // Hand the opponent a free move; if we still beat beta the position is
@@ -644,6 +792,24 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         if (depth >= kNMPMinDepth && eval >= beta &&
             (ss - 1)->current_move != Move(Move::NULL_MOVE) &&
             has_non_pawn_material(board, board.sideToMove())) {
+            bool nmp_ok = true;
+            if constexpr (SC_PASSEVAL) {
+                // Static prediction of the null search (T computed lazily, only here if no
+                // earlier plug asked). P_est = eval - T: the (TT-sharpened) eval as the node's
+                // best value estimate minus the static tempo. Skip the null search when passing
+                // looks better than moving (the zugzwang signature NMP is blind to) or when the
+                // passed position is already far below beta (the reduced search would fail low
+                // and its cost is wasted). Both thresholds individually guarded: 0 = off.
+                const int zug = pass_[PASS_ZUG], nm = pass_[PASS_NMP_MARGIN];
+                if ((zug > 0 || nm > 0) && !is_mate_score(beta)) {
+                    need_tension();
+                    if (tension != VALUE_NONE) {
+                        if (zug > 0 && tension < -zug)             nmp_ok = false;
+                        if (nm > 0 && eval - tension < beta - nm)  nmp_ok = false;
+                    }
+                }
+            }
+            if (nmp_ok) {
             const Depth R = 4 + depth / 4 + std::min(3, (eval - beta) / 200);
 
             ss->current_move = Move(Move::NULL_MOVE);
@@ -660,6 +826,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
             // Never return unproven mate scores from a null search.
             if (v >= beta) return is_mate_score(v) ? beta : v;
+            }
         }
 
         // ---- ProbCut ----
@@ -702,6 +869,8 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     }
 
     // ---- Move loop ----
+    if constexpr (SC_PASSEVAL)   // LMR reads tn for every reduced move: compute T now, at THIS node
+        if (pass_[PASS_LMR_DIV] > 0 && depth >= 2) need_tension();
     OrderingContext ctx;
     ctx.tt_move     = tt_move;
     ctx.killer0     = ss->killers[0];
@@ -843,6 +1012,63 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             else
                 r -= std::clamp(picker.last_score() / 8192, -2, 2);  // history-informed
 
+            if constexpr (SC_PASSEVAL) {
+                // Reduce MORE under tension, and only quiets. The measured signal (F1, phase
+                // controlled): best-move change d3->d7 falls 66.9% -> 39.9% from the lowest to the
+                // highest T decile, partial Spearman(T, unstable | |E|, occ) = -0.152 and negative
+                // within every phase. High tension means the position is FORCED, so a late QUIET is
+                // LESS likely than usual to be the refutation -- the opposite of what the first
+                // attempt assumed, which lost 4 Elo. (|R| also rises with T, but that is error in
+                // the eval NUMBER, which LMR never returns; it belongs to the RFP margin.)
+                // Captures and check-givers are exempt: in a forced position they ARE the candidate
+                // refutation, and they already get r -= 1 / r -= gives_check_now above. The first
+                // attempt applied its term outside that branch, so it hit them too. Kept before the
+                // width scaling on purpose: a positive term is damped at an unstable root, where a
+                // negative one used to escape damping entirely by driving r <= 0.
+                const int div = pass_[PASS_LMR_DIV];
+                if (div > 0 && quiet && !gives_check_now) r += std::min(2, tn / div);
+            }
+
+            if constexpr (SC_THRSIG > 0) {
+                // Item #9: do not reduce a quiet move that creates a new attack on a higher-valued
+                // piece. Unlike item #8's feature-delta magnitude, which failed in both directions,
+                // this is a semantic condition -- "this move makes a threat" -- and it is the class of
+                // quiet move a reduction is most likely to mis-handle, because history scores where a
+                // move worked before, not what it threatens here.
+                if (quiet && !gives_check_now && nnue::acc_threats_made() >= SC_THRSIG_MIN)
+                    r -= SC_THRSIG;
+            }
+
+            if constexpr (SC_ACCSIG != 0 && SC_ACCSIG_LOW > 0) {
+                // Reduce a quiet MORE when it barely changes what the net sees: a move whose feature
+                // delta is in the bottom quartile is a do-nothing move (a shuffle behind the lines),
+                // and is correspondingly unlikely to be the refutation. Structurally cheaper than the
+                // relief form below, because this one PRUNES harder and so shrinks the tree, where
+                // reducing less grows it -- the measured difference between starting ~3 Elo behind and
+                // starting ahead.
+                if (quiet && !gives_check_now && nnue::acc_delta_l1() < SC_ACCSIG_LOW)
+                    r += 1;
+            }
+
+            if constexpr (SC_ACCSIG != 0 && SC_ACCSIG_DIV > 0) {
+                // Item #8: reduce a quiet move LESS when it changes what the net sees a lot.
+                // sig = ||accumulator(child) - accumulator(parent)||_1, i.e. the L1 norm of the
+                // feature columns this move swaps -- a per-MOVE measure of how consequential the
+                // move is, which history cannot supply because history scores a move's past
+                // success, not how much it alters this position's features.
+                //
+                // Why this is not E2 repeated. E2's tension was a property of the NODE, identical
+                // for every late quiet there, so it could only shift the average reduction and had
+                // nothing to discriminate with; it failed in both directions. This signal differs
+                // per move at the same node, which is the shape a reduction decision actually
+                // wants. Captures and check-givers stay exempt for the same reason as in E2: they
+                // already get relief above.
+                if (quiet && !gives_check_now && depth >= SC_ACCSIG_MINDEPTH) {
+                    const int sig = nnue::acc_delta_l1();
+                    r -= std::min(SC_ACCSIG_MAX, sig / SC_ACCSIG_DIV);
+                }
+            }
+
             // Adaptive width: shrink positive reductions in proportion to the
             // current width (continuous widening; never scales extensions,
             // only reductions).
@@ -947,9 +1173,36 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             const bool best_cap  = have_best && board.isCapture(best_move);
             if (!in_check && !best_cap && ss->static_eval != VALUE_NONE &&
                 !is_mate_score(best) && (best > ss->static_eval) == have_best) {
-                const int bonus = std::clamp((best - ss->static_eval) * depth *
-                                                 (have_best ? 12 : 18) / 128,
-                                             -HISTORY_MAX / 4, HISTORY_MAX / 4);
+                int bonus = std::clamp((best - ss->static_eval) * depth *
+                                           (have_best ? 12 : 18) / 128,
+                                       -HISTORY_MAX / 4, HISTORY_MAX / 4);
+                if constexpr (SC_PASSEVAL) {
+                    // Weight the update by how LEARNABLE this node's residual is, not by how large
+                    // it is. Correction history can only absorb the part of R = search - static that
+                    // is consistent among positions sharing the key; the rest is noise it averages
+                    // away. F2 (tools/verify/passeval_learnability.py) measured exactly that on F1's
+                    // 19,529 rows, as the intraclass correlation of R within pawn-structure keys:
+                    // it RISES with tension, 0.5456 -> 0.6004 from the lowest to the highest T
+                    // quintile, while mean |R| rises 117 -> 222. So high-tension residuals are both
+                    // bigger AND more systematically tied to the key, and deserve a larger step.
+                    //
+                    // This is the only plug point in the campaign whose direction comes from a
+                    // measurement of its OWN mechanism rather than from a general tension statistic;
+                    // E5 failed twice by borrowing the move-stability table for a question about
+                    // scores, so the distinction is load-bearing.
+                    //
+                    // T is needed only at nodes that actually reach this update, which is why the
+                    // query sits here rather than at the node head, and only at depth >=
+                    // PassMinDepth -- deep nodes carry the most reliable labels anyway.
+                    const int w = pass_[PASS_CORR_W];
+                    if (w > 0) {
+                        need_tension();
+                        if (tension != VALUE_NONE)
+                            bonus = std::clamp(static_cast<int>(
+                                        static_cast<std::int64_t>(bonus) * (256 + tn * w / 16) / 256),
+                                    -HISTORY_MAX / 4, HISTORY_MAX / 4);
+                    }
+                }
                 history_update(history_.corr_pawn[stm][corr_idx], bonus);
             }
         }
@@ -1046,11 +1299,6 @@ void Worker::think() {
         (pool_.limits_.depth > 0) ? std::min<Depth>(pool_.limits_.depth, MAX_PLY - 1)
                                   : MAX_PLY - 1;
 
-    // Root material phase (24 == full board), for the breadth-mode endgame guard.
-    const int root_phase =
-        (board.pieces(PieceType::KNIGHT).count() + board.pieces(PieceType::BISHOP).count()) +
-        2 * board.pieces(PieceType::ROOK).count() + 4 * board.pieces(PieceType::QUEEN).count();
-
     Value prev_score = VALUE_NONE;
     Move  prev_best  = Move(Move::NO_MOVE);
     int   stable     = 0;  // consecutive completed iterations with the same best move
@@ -1064,6 +1312,8 @@ void Worker::think() {
         nnue::acc_reset(board);  // fresh incremental base accumulator at the root
 
         width_    = pool_.width_.load(std::memory_order_relaxed);  // stable per iteration
+        if constexpr (SC_PASSEVAL)   // one consistent tunable set per iteration (see kPassParams)
+            for (int i = 0; i < PASS_N; ++i) pass_[i] = g_pass[i].load(std::memory_order_relaxed);
         seldepth_ = 0;
 
         // ---- Aspiration windows ----
@@ -1117,9 +1367,8 @@ void Worker::think() {
                 const int wg = std::max<Value>(0, kBreadthGapRange -
                                                       std::max<Value>(0, score - root_second_));
                 const int ws = std::max<Value>(0, kBreadthScoreRange - std::abs(score));
-                const int wp = std::clamp(root_phase - kBreadthPhaseMin, 0, kBreadthPhaseSpan);
-                width        = kBreadthMax * wg * ws * wp /
-                        (kBreadthGapRange * kBreadthScoreRange * kBreadthPhaseSpan);
+                width        = kBreadthMax * wg * ws /
+                        (kBreadthGapRange * kBreadthScoreRange);
             }
             const int old = pool_.width_.load(std::memory_order_relaxed);
             if (width != old) {
@@ -1163,6 +1412,34 @@ void Worker::think() {
             // real game clock, not a fixed `movetime` (there is no clock to
             // save, so we honor the full think).
             std::int64_t soft = pool_.budget_.soft_ms;
+            if constexpr (SC_PASSEVAL) {
+                // Root tension: spend MORE time where tension is high, LESS where it is low, at
+                // constant mean. Measured, not assumed: the opposite apportionment (E5-prime) lost
+                // 18 Elo [-36, -1], LOS 2%, over 538 games at the same mean time, so the direction
+                // is established by experiment rather than by which correlation one picks.
+                //
+                // Why the instability table misleads here. Tension predicts that the best MOVE is
+                // settled (change d3->d7 falls 66.9% -> 39.9%), which argues for less time; but it
+                // also predicts that the static SCORE is badly wrong (mean |R| 96.8 -> 235.2 across
+                // the same deciles, and that survives phase control). Time allocation should track
+                // the second, not the first: a node whose move is already settled still hands its
+                // parent a score, and a score that is 235 cp off loses games no matter how stable
+                // the move was. Extra search buys score accuracy where there is most of it to buy.
+                //
+                // Mean-preserving by construction: the factor is -PassTmScale/256 at tn = 0, crosses
+                // exactly 1.0 at kPassTmMid (the measured median of tn) and saturates at
+                // +PassTmScale/256. The ORIGINAL design had this direction but scaled upward only,
+                // so it raised mean time per move and tested "think longer" as much as "think where
+                // it matters"; a PASS could not have been attributed to either. Clock games only;
+                // never past the hard limit (a soft above hard would only ever end in a truncated
+                // iteration).
+                const int ts = pass_[PASS_TM_SCALE];
+                if (ts > 0 && root_tension_ != VALUE_NONE && pool_.limits_.movetime == 0) {
+                    const int tn  = std::clamp<int>(root_tension_ - pass_[PASS_TAU], 0, pass_[PASS_CAP]);
+                    const int adj = std::clamp<int>(tn * ts / kPassTmMid, 0, 2 * ts) - ts;
+                    soft = std::min<std::int64_t>(pool_.budget_.hard_ms, soft * (256 + adj) / 256);
+                }
+            }
             if (pool_.limits_.movetime == 0 && d >= kEffortMinDepth &&
                 stable >= kEffortStable && !is_mate_score(score) && root_n_ > 1) {
                 std::uint64_t total = 0, best_cost = 0;
@@ -1219,9 +1496,10 @@ void Worker::think() {
         }
 
         if (!g_gen_silent) {
-            std::cout << "bestmove " << chess::uci::moveToUci(best_move_);
+            const bool c960 = pool_.root_.chess960();  // castling spelling follows the root's mode
+            std::cout << "bestmove " << chess::uci::moveToUci(best_move_, c960);
             if (ponder_move_ != Move(Move::NO_MOVE))
-                std::cout << " ponder " << chess::uci::moveToUci(ponder_move_);
+                std::cout << " ponder " << chess::uci::moveToUci(ponder_move_, c960);
             std::cout << std::endl;
         }
 
@@ -1236,7 +1514,7 @@ std::string Worker::pv_string() const {
     std::ostringstream ss;
     for (int i = 0; i < pv_len_[0]; ++i) {
         if (i) ss << ' ';
-        ss << chess::uci::moveToUci(pv_[0][i]);
+        ss << chess::uci::moveToUci(pv_[0][i], pool_.root_.chess960());
     }
     return ss.str();
 }

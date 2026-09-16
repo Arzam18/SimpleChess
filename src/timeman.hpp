@@ -37,6 +37,7 @@ struct SearchLimits {
     int          mate       = 0;       // search for a mate in `mate` moves
     bool         infinite   = false;   // search until `stop`
     bool         ponder     = false;   // pondering (search on opponent's time)
+    int          move_overhead_ms = 30; // UCI `Move Overhead`: per-move reserve for GUI/network lag
 
     [[nodiscard]] bool uses_time_control() const noexcept {
         return !infinite && depth == 0 && nodes == 0 && movetime == 0 && mate == 0;

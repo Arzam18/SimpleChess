@@ -771,19 +771,26 @@ void refresh_into(Acc& a, const Board& board) {
         fused_apply_src(a.v[p], n.l0b_i.data(), cols[p], nc[p], nullptr, 0, hl);
 }
 
-// Fixed-point (int32) full refresh for the float labeler path: seed from l0b_fx, then
-// gather adds l0w_fx rows. Mirrors refresh_into; the scalar int32 add auto-vectorises.
+inline void fused_apply_src_fx(std::int32_t* dst, const std::int32_t* src, const std::int32_t* const* add, int na,
+                               const std::int32_t* const* sub, int ns, int hl);
+
+// Fixed-point (int32) full refresh for the float labeler path. Mirrors refresh_into:
+// collect every active column, then ONE src->dst fused pass per perspective straight
+// from the bias vector -- no bias seed loop, no 2 KB accumulator read+write per feature.
+// int32 sums are order-independent -> bit-identical. (Self-play campaign FX1: +12.0%.)
 void refresh_into_fx(AccFx& a, const Board& board) {
     const Net& n = g_net;
     const int hl = n.hl;
     const std::int32_t* l0 = n.l0w_fx.data();
-    for (int p = 0; p < 2; ++p)
-        for (int j = 0; j < hl; ++j) a.v[p][j] = n.l0b_fx[j];
     const int stmp = (board.sideToMove() == Color::WHITE) ? 0 : 1;
+    static thread_local const std::int32_t* cols[2][1024];
+    int nc[2] = {0, 0};
     gather(
         board, n.base_dims,
-        [&](std::size_t f) { const std::int32_t* w = l0 + f * hl; for (int j = 0; j < hl; ++j) a.v[stmp][j] += w[j]; },
-        [&](std::size_t f) { const std::int32_t* w = l0 + f * hl; for (int j = 0; j < hl; ++j) a.v[1 - stmp][j] += w[j]; });
+        [&](std::size_t f) { cols[stmp][nc[stmp]++] = l0 + f * hl; },
+        [&](std::size_t f) { cols[1 - stmp][nc[1 - stmp]++] = l0 + f * hl; });
+    for (int p = 0; p < 2; ++p)
+        fused_apply_src_fx(a.v[p], n.l0b_fx.data(), cols[p], nc[p], nullptr, 0, hl);
 }
 
 // ---- incremental THREAT delta helpers ---------------------------------------
@@ -817,6 +824,15 @@ struct BB {
 // normal move reads its before-state from g_bb[g_ply] instead of rebuilding a BB
 // from board.at() every make. Same g_ply / reset / make / unmake / null hooks.
 thread_local std::vector<BB> g_bb;
+
+// Item #9 (novelty ledger): how many NEW attacks on a HIGHER-valued enemy piece the last acc_make's
+// move created, counted for the mover's side only. The threat-delta emitter already has the attacker
+// and the victim in hand for every column it adds, so this is two comparisons per emission rather
+// than any new enumeration -- the same "read what the net already computed" shape as item #8, but a
+// semantically sharp count (this move makes a threat) instead of a magnitude of feature change.
+// Zero on the king-cross refresh path, where the threat set is rebuilt rather than emitted as a
+// delta: a false negative on a few percent of moves, never a false positive.
+thread_local int g_threats_made = 0;
 
 // Squares of all pieces attacking `s` (both colors).
 inline std::uint64_t attackers_of(const BB& bb, int s) {
@@ -1239,15 +1255,56 @@ inline void fused_apply_src(std::int16_t* dst, const std::int16_t* src, const st
 #endif
 }
 
-// Fixed-point fused apply for the float labeler: int32 accumulator, int32 weight
-// columns, 8 lanes/iter (two int32x4). Integer add is associative -> bit-exact.
+// Fixed-point in-place fused apply for the float labeler (int32 accumulator, int32 weight
+// columns): the src == dst form of fused_apply_src_fx below (aliasing is safe: each chunk is
+// fully loaded before it is stored). Integer add is associative -> bit-exact.
 inline void fused_apply_fx(std::int32_t* acc, const std::int32_t* const* add, int na,
                            const std::int32_t* const* sub, int ns, int hl) {
+    fused_apply_src_fx(acc, acc, add, na, sub, ns, hl);
+}
+
+// dst = src (+ add columns) (- sub columns) in ONE pass for the int32 fixed-point
+// accumulator (float labeler): the FX analog of fused_apply_src (x86 G4 / NEON N1).
+// Replaces memcpy(dst, src) + a separate column pass. int32 sums are order-independent
+// -> bit-identical labels. (Self-play campaign FX2 single pass +6.5%, FX3 blocking +6.4%.)
+inline void fused_apply_src_fx(std::int32_t* dst, const std::int32_t* src, const std::int32_t* const* add, int na,
+                               const std::int32_t* const* sub, int ns, int hl) {
 #if defined(__ARM_NEON)
-    // §L2: two independent accumulators per 4-lane group break the serial add-chain
-    // (better NEON ILP). int32 add is associative -> any grouping is bit-identical.
-    for (int c = 0; c < hl; c += 8) {
-        int32x4_t a0 = vld1q_s32(acc + c),  a1 = vld1q_s32(acc + c + 4);
+    int c = 0;
+    // N2b analog: 32 int32 per chunk -- 8 vectors x 2 lanes = 16 accumulators, a quarter of
+    // the chunk iterations of the 8-wide form and 4x the adds in flight.
+#define SCFX_COL32(V0, V1, V2, V3, V4, V5, V6, V7, P, OP)                                        \
+    {                                                                                            \
+        V0 = OP(V0, vld1q_s32((P) + c));      V1 = OP(V1, vld1q_s32((P) + c + 4));               \
+        V2 = OP(V2, vld1q_s32((P) + c + 8));  V3 = OP(V3, vld1q_s32((P) + c + 12));              \
+        V4 = OP(V4, vld1q_s32((P) + c + 16)); V5 = OP(V5, vld1q_s32((P) + c + 20));              \
+        V6 = OP(V6, vld1q_s32((P) + c + 24)); V7 = OP(V7, vld1q_s32((P) + c + 28));              \
+    }
+    for (; c + 32 <= hl; c += 32) {
+        int32x4_t v0 = vld1q_s32(src + c),      v1 = vld1q_s32(src + c + 4),
+                  v2 = vld1q_s32(src + c + 8),  v3 = vld1q_s32(src + c + 12),
+                  v4 = vld1q_s32(src + c + 16), v5 = vld1q_s32(src + c + 20),
+                  v6 = vld1q_s32(src + c + 24), v7 = vld1q_s32(src + c + 28);
+        int32x4_t u0 = vdupq_n_s32(0), u1 = u0, u2 = u0, u3 = u0, u4 = u0, u5 = u0, u6 = u0, u7 = u0;
+        int k = 0;
+        for (; k + 1 < na; k += 2) {
+            SCFX_COL32(v0, v1, v2, v3, v4, v5, v6, v7, add[k],     vaddq_s32)
+            SCFX_COL32(u0, u1, u2, u3, u4, u5, u6, u7, add[k + 1], vaddq_s32)
+        }
+        for (; k < na; ++k) SCFX_COL32(v0, v1, v2, v3, v4, v5, v6, v7, add[k], vaddq_s32)
+        for (k = 0; k + 1 < ns; k += 2) {
+            SCFX_COL32(v0, v1, v2, v3, v4, v5, v6, v7, sub[k],     vsubq_s32)
+            SCFX_COL32(u0, u1, u2, u3, u4, u5, u6, u7, sub[k + 1], vsubq_s32)
+        }
+        for (; k < ns; ++k) SCFX_COL32(v0, v1, v2, v3, v4, v5, v6, v7, sub[k], vsubq_s32)
+        vst1q_s32(dst + c,      vaddq_s32(v0, u0)); vst1q_s32(dst + c + 4,  vaddq_s32(v1, u1));
+        vst1q_s32(dst + c + 8,  vaddq_s32(v2, u2)); vst1q_s32(dst + c + 12, vaddq_s32(v3, u3));
+        vst1q_s32(dst + c + 16, vaddq_s32(v4, u4)); vst1q_s32(dst + c + 20, vaddq_s32(v5, u5));
+        vst1q_s32(dst + c + 24, vaddq_s32(v6, u6)); vst1q_s32(dst + c + 28, vaddq_s32(v7, u7));
+    }
+#undef SCFX_COL32
+    for (; c < hl; c += 8) {   // hl % 32 tail (empty for hl = 512)
+        int32x4_t a0 = vld1q_s32(src + c),  a1 = vld1q_s32(src + c + 4);
         int32x4_t b0 = vdupq_n_s32(0),      b1 = vdupq_n_s32(0);
         int k = 0;
         for (; k + 1 < na; k += 2) {
@@ -1264,12 +1321,13 @@ inline void fused_apply_fx(std::int32_t* acc, const std::int32_t* const* add, in
         for (; k < ns; ++k) {
             a0 = vsubq_s32(a0, vld1q_s32(sub[k] + c));      a1 = vsubq_s32(a1, vld1q_s32(sub[k] + c + 4));
         }
-        vst1q_s32(acc + c,     vaddq_s32(a0, b0));
-        vst1q_s32(acc + c + 4, vaddq_s32(a1, b1));
+        vst1q_s32(dst + c,     vaddq_s32(a0, b0));
+        vst1q_s32(dst + c + 4, vaddq_s32(a1, b1));
     }
 #else
-    for (int k = 0; k < na; ++k) { const std::int32_t* w = add[k]; for (int j = 0; j < hl; ++j) acc[j] += w[j]; }
-    for (int k = 0; k < ns; ++k) { const std::int32_t* w = sub[k]; for (int j = 0; j < hl; ++j) acc[j] -= w[j]; }
+    if (dst != src) std::memcpy(dst, src, static_cast<std::size_t>(hl) * sizeof(std::int32_t));
+    for (int k = 0; k < na; ++k) { const std::int32_t* w = add[k]; for (int j = 0; j < hl; ++j) dst[j] += w[j]; }
+    for (int k = 0; k < ns; ++k) { const std::int32_t* w = sub[k]; for (int j = 0; j < hl; ++j) dst[j] -= w[j]; }
 #endif
 }
 
@@ -1456,7 +1514,11 @@ inline int build_nnz(const float* h, int n, int* nz) {
 #endif
 }
 
-Value eval_float(const Board& board) {
+// SWAP=false: the position as it is. SWAP=true: the same accumulator read with the two
+// perspectives exchanged (the position after a pass), negated so the result is from the
+// ORIGINAL side to move's point of view. See evaluate_pass() in nnue.hpp.
+template <bool SWAP>
+Value eval_float_t(const Board& board) {
     const Net& n = g_net;
     const int hl = n.hl, half = hl / 2, L2 = n.l2, OB = n.out_buckets;
     // §3.1: read the incremental fixed-point accumulator (int32, scale FX_S) and
@@ -1500,6 +1562,10 @@ Value eval_float(const Board& board) {
     }
 
     alignas(64) float h[MAX_HL];
+    // Pairwise destinations (see eval_quant_t): SWAP exchanges the two perspectives, i.e. the
+    // eval of the position with the side to move flipped (the position after a pass).
+    const int off_stm = SWAP ? half : 0;
+    const int off_ntm = SWAP ? 0 : half;
 #if defined(__ARM_NEON)
     // §2.3: elementwise crelu(a)*crelu(b), 4 lanes/iter. clamp = vmin(vmax(x,0),1),
     // bit-identical to std::clamp for finite accumulator values. half % 4 == 0.
@@ -1507,15 +1573,15 @@ Value eval_float(const Board& board) {
     for (int i = 0; i < half; i += 4) {
         const float32x4_t a = vminq_f32(vmaxq_f32(vld1q_f32(acc_stm + i),        vz), vo);
         const float32x4_t b = vminq_f32(vmaxq_f32(vld1q_f32(acc_stm + i + half), vz), vo);
-        vst1q_f32(h + i, vmulq_f32(a, b));
+        vst1q_f32(h + off_stm + i, vmulq_f32(a, b));
         const float32x4_t c = vminq_f32(vmaxq_f32(vld1q_f32(acc_ntm + i),        vz), vo);
         const float32x4_t d = vminq_f32(vmaxq_f32(vld1q_f32(acc_ntm + i + half), vz), vo);
-        vst1q_f32(h + half + i, vmulq_f32(c, d));
+        vst1q_f32(h + off_ntm + i, vmulq_f32(c, d));
     }
 #else
     for (int i = 0; i < half; ++i) {
-        h[i]        = crelu(acc_stm[i]) * crelu(acc_stm[i + half]);
-        h[half + i] = crelu(acc_ntm[i]) * crelu(acc_ntm[i + half]);
+        h[off_stm + i] = crelu(acc_stm[i]) * crelu(acc_stm[i + half]);
+        h[off_ntm + i] = crelu(acc_ntm[i]) * crelu(acc_ntm[i + half]);
     }
 #endif
     const int b = output_bucket(board, OB);
@@ -1566,7 +1632,8 @@ Value eval_float(const Board& board) {
         x1[o] = screlu(s);
     }
 #endif
-    return finish_body(n, x1, b);
+    const Value v = finish_body(n, x1, b);
+    return SWAP ? -v : v;
 }
 
 // Quantised (SCN5): int8 feature transformer (x QA=127) with int16 bias and int16
@@ -1579,7 +1646,10 @@ Value eval_float(const Board& board) {
 // int16 headroom: |l0w_i8| <= QA=127 (l0w is clipped to +/-0.99 in training, then
 // x127), so the accumulator holds ~250 active features before nearing 32767; real
 // positions peak ~112 (verified over 200k positions), so it does not overflow.
-Value eval_quant(const Board& board) {
+// SWAP as in eval_float_t: false = the position as it is, true = the perspectives exchanged
+// (the position after a pass), negated to the original side to move's point of view.
+template <bool SWAP>
+Value eval_quant_t(const Board& board) {
     const Net& n = g_net;
     const int hl = n.hl, half = hl / 2, L2 = n.l2, OB = n.out_buckets;
 
@@ -1623,6 +1693,13 @@ Value eval_quant(const Board& board) {
     // two halves, and scale down by QA so the result fits int8 [0,QA]. This is
     // the L1 input for the sdot dot-products (h8 = pairwise * QA).
     alignas(16) std::int8_t h8[MAX_HL];
+    // Where each perspective's pairwise products land in h8. SWAP=false: side to move first
+    // (the position as it is). SWAP=true: the two perspectives exchanged, i.e. the net sees the
+    // position with the side to move flipped -- the position after a pass. Nothing above this
+    // line depends on the side to move (Acc::v is per absolute colour, the output bucket is
+    // occupancy-only), so the swapped query is exactly the eval of the null-moved position.
+    const int off_stm = SWAP ? half : 0;
+    const int off_ntm = SWAP ? 0 : half;
 #if defined(__ARM_NEON)
     // NEON, 8 lanes/iter. Bit-identical to the scalar form: clamped products are
     // <= QA*QA = 16129 (fit int16), and floor(p/127) == (p*16514) >> 21 exactly
@@ -1639,14 +1716,14 @@ Value eval_quant(const Board& board) {
         vst1_s8(dst, vmovn_s16(vcombine_s16(vmovn_s32(lo), vmovn_s32(hi))));
     };
     for (int i = 0; i < half; i += 8) {
-        pairwise8(acc_stm + i, h8 + i);
-        pairwise8(acc_ntm + i, h8 + half + i);
+        pairwise8(acc_stm + i, h8 + off_stm + i);
+        pairwise8(acc_ntm + i, h8 + off_ntm + i);
     }
 #else
     auto cr = [](int x) -> int { return x < 0 ? 0 : (x > QA ? QA : x); };
     for (int i = 0; i < half; ++i) {
-        h8[i]        = static_cast<std::int8_t>((cr(acc_stm[i]) * cr(acc_stm[i + half])) / QA);
-        h8[half + i] = static_cast<std::int8_t>((cr(acc_ntm[i]) * cr(acc_ntm[i + half])) / QA);
+        h8[off_stm + i] = static_cast<std::int8_t>((cr(acc_stm[i]) * cr(acc_stm[i + half])) / QA);
+        h8[off_ntm + i] = static_cast<std::int8_t>((cr(acc_ntm[i]) * cr(acc_ntm[i + half])) / QA);
     }
 #endif
     const int b = output_bucket(board, OB);
@@ -1763,13 +1840,18 @@ Value eval_quant(const Board& board) {
         x1[o] = screlu(static_cast<float>(s) / DEQ + n.l1b[b * L2 + o]);
     }
 #endif
-    return finish_body(n, x1, b);
+    const Value v = finish_body(n, x1, b);
+    return SWAP ? -v : v;
 }
 
 }  // namespace
 
 Value evaluate(const Board& board) {
-    return g_net.quant ? eval_quant(board) : eval_float(board);
+    return g_net.quant ? eval_quant_t<false>(board) : eval_float_t<false>(board);
+}
+
+Value evaluate_pass(const Board& board) {
+    return g_net.quant ? eval_quant_t<true>(board) : eval_float_t<true>(board);
 }
 
 // ---- incremental accumulator hooks (called by search) -----------------------
@@ -1794,6 +1876,7 @@ template <class AccT, class WT>
 void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
                 const WT* l0, void (*refresh_fn)(AccT&, const Board&)) {
     constexpr bool FX = (sizeof(WT) != 1);  // int32 fixed-point float vs int8 quant
+    g_threats_made = 0;                     // item #9: per-move, so reset on every entry
     if (g_ply < 0 || g_ply + 1 >= ACC_STACK) { g_ply = -1; return; }
     const int hl = g_net.hl;
     AccT& cur = g_stk[g_ply];
@@ -1803,11 +1886,11 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         if constexpr (FX) fused_apply_fx(acc, add, na, sub, ns, hl);
         else              fused_apply(acc, add, na, sub, ns, hl);
     };
-    // G4 single pass: dst = src +/- columns (quant path only; the float labeler keeps two passes).
+    // G4 single pass: dst = src +/- columns (quant path; the float labeler joins with FX2).
     [[maybe_unused]] auto fused_src = [&](auto* dst, const auto* src, const WT* const* add, int na,
                                           const WT* const* sub, int ns) {
-        if constexpr (!FX) fused_apply_src(dst, src, add, na, sub, ns, hl);
-        else { (void)dst; (void)src; (void)add; (void)na; (void)sub; (void)ns; }
+        if constexpr (FX) fused_apply_src_fx(dst, src, add, na, sub, ns, hl);
+        else              fused_apply_src(dst, src, add, na, sub, ns, hl);
     };
     const int from = m.from().index(), to = m.to().index();
     const int moved_pi = static_cast<int>(before.at(m.from()).internal());
@@ -1846,12 +1929,13 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         g_bb[g_ply + 1] = BB(b);  // keep the incremental BB chain in sync
         b.unmakeMove(m);
     } else {
-        // Single pass (quant + direct path; x86 campaign G4, +3.7% all phases): the base
-        // columns are deferred into the threat add/sub lists and ONE src->dst fused pass per
-        // perspective reads cur and writes nxt -- no 2x1 KB memcpy, no separate base pass.
-        // int16 sums are order-independent -> bit-identical. The probes (NOUPDATE/NOCOLS/
-        // NODIRECT) and the float labeler keep the two-pass form.
-        const bool single_pass = !FX && g_direct && !g_no_update && !g_no_cols;
+        // Single pass (x86 campaign G4, +3.7% all phases): the base columns are deferred into
+        // the threat add/sub lists and ONE src->dst fused pass per perspective reads cur and
+        // writes nxt -- no memcpy, no separate base pass. Integer sums are order-independent
+        // -> bit-identical. The probes (NOUPDATE/NOCOLS/NODIRECT) keep the two-pass form.
+        // The float labeler takes the same single pass (int32 sums -> bit-identical; self-play
+        // campaign FX2). The NODIRECT probe is int16-only, so FX ignores g_direct here.
+        const bool single_pass = (FX || g_direct) && !g_no_update && !g_no_cols;
         if (!single_pass) {
             std::memcpy(nxt.v[0], cur.v[0], hl * sizeof(nxt.v[0][0]));
             std::memcpy(nxt.v[1], cur.v[1], hl * sizeof(nxt.v[0][0]));
@@ -1921,6 +2005,11 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
             if (add) addp[p][na[p]++] = col; else subp[p][ns[p]++] = col;
         };
         auto emit_threat = [&](int a_sf, int a_sq, int t_sq, int attacked, bool add) {
+            // Item #9: count only threats the MOVER gains on a higher-valued victim. piece-type bits
+            // (1=pawn..5=queen) are ordered by value, so the comparison needs no table; the colour
+            // bit (8) selects the mover's own attackers, so a threat created AGAINST the mover does
+            // not inflate the count.
+            if (add && (a_sf & 8) == (sf_moved & 8) && (attacked & 7) > (a_sf & 7)) ++g_threats_made;
             const std::uint32_t s = make_threat_index(a_sf, a_sq ^ wo, t_sq ^ wo, attacked);
             if (s < (std::uint32_t)THREAT_DIMS) push(0, s, add);
             const std::uint32_t nn = make_threat_index(a_sf ^ 8, a_sq ^ bo, t_sq ^ bo, attacked ^ 8);
@@ -2117,6 +2206,40 @@ void acc_make(const Board& before, Move m) {
 }
 
 void acc_unmake() { if (g_ply > 0) g_ply--; }
+
+// Accumulator units read by acc_delta_l1: a CONTIGUOUS PREFIX of each perspective, not all of them.
+// The full 1024-unit norm measured -3.395% nps with the tree held identical
+// (logs/accsig/cost-pure.json), which a term firing on a quarter of quiet moves cannot pay for. The
+// plug only needs to rank a move against a quartile threshold, not to know the norm exactly, and the
+// hidden units carry no ordering, so a fixed prefix is as good a sample as any.
+//
+// It must be a PREFIX and not a stride: SC_ACCSIG_STRIDE=4 measured -5.763%, WORSE than reading
+// everything, because the contiguous loop auto-vectorises to 16-wide SIMD and a strided one does not
+// -- 64 vector operations become 256 scalar ones with strided loads (logs/accsig/cost-pure4.json).
+#ifndef SC_ACCSIG_UNITS
+#define SC_ACCSIG_UNITS 128
+#endif
+
+int acc_threats_made() noexcept { return g_net.quant ? g_threats_made : 0; }
+
+int acc_delta_l1() noexcept {
+    // Item #8 (novelty ledger): the magnitude of the feature-column change a move makes.
+    // A quiet move swaps two columns per perspective, so this is ||W[to] - W[from]||_1 read
+    // off the accumulator stack rather than recomputed -- the values are already resident,
+    // which is what makes the signal cheap. Both perspectives are summed because the mover's
+    // piece changes square in both halves' feature sets.
+    if (g_ply < 1 || !g_net.quant) return 0;
+    const int hl = g_net.hl;
+    const std::int16_t* c0 = g_stack[g_ply].v[0];
+    const std::int16_t* p0 = g_stack[g_ply - 1].v[0];
+    const std::int16_t* c1 = g_stack[g_ply].v[1];
+    const std::int16_t* p1 = g_stack[g_ply - 1].v[1];
+    const int n = hl < SC_ACCSIG_UNITS ? hl : SC_ACCSIG_UNITS;
+    int sum = 0;
+    for (int j = 0; j < n; ++j)
+        sum += std::abs(int(c0[j]) - int(p0[j])) + std::abs(int(c1[j]) - int(p1[j]));
+    return sum;
+}
 
 void acc_make_null() {
     if (g_ply < 0 || g_ply + 1 >= ACC_STACK) { g_ply = -1; return; }

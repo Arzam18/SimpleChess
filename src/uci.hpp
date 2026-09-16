@@ -41,7 +41,14 @@ class UCI {
     void handle_position(std::istringstream& is);
     void handle_go(std::istringstream& is);
     void handle_gengame(std::istringstream& is);  // in-engine self-play game generation
+    void handle_perft(std::istringstream& is);    // debug: bulk-counted perft of the current position
     void handle_print() const;
+
+    // Parse a FEN into `out` in the current mode: the plain FEN parser when UCI_Chess960 is
+    // off (K/Q/k/q only, as before 3.2), the X-FEN parser when it is on (K/Q = the outermost
+    // rook, A-H/a-h Shredder file letters, sets the board's chess960 flag). `out` is only
+    // assigned on success; a FEN without both kings is rejected.
+    bool set_fen(Board& out, std::string_view fen) const;
 
     void try_load_default_net();
 
@@ -57,6 +64,8 @@ class UCI {
     int         move_overhead_ = 30;    // "Move Overhead", in ms
     bool        ponder_        = false; // "Ponder"
     bool        own_book_      = false; // "OwnBook" — opt-in; no book ships or loads by default
+    bool        chess960_      = false; // "UCI_Chess960" — read by the NEXT position/gengame
+                                        // (lazy, like Stockfish); never re-sets the current board
 };
 
 }  // namespace engine

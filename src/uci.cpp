@@ -9,6 +9,8 @@
 #include "uci.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -142,6 +144,7 @@ void UCI::handle_uci() const {
               << " min 1 max " << Search::kMaxThreads << "\n";
     std::cout << "option name Move Overhead type spin default 30 min 0 max 5000\n";
     std::cout << "option name Ponder type check default false\n";
+    std::cout << "option name UCI_Chess960 type check default false\n";
     std::cout << "option name Clear Hash type button\n";
     std::cout << "option name OwnBook type check default false\n";
     std::cout << "option name Book File type string default <empty>\n";
@@ -159,6 +162,7 @@ void UCI::handle_uci() const {
 #define SC_STR(x) SC_STR_(x)
     std::cout << "option name BuildTag type string default " << SC_STR(SC_BUILD_TAG) << "\n";
 #endif
+    pass_param_options(std::cout);  // Pass* tunables, advertised only in SC_PASSEVAL builds
     std::cout << "uciok" << std::endl;
 }
 
@@ -167,8 +171,54 @@ void UCI::handle_isready() const { std::cout << "readyok" << std::endl; }
 void UCI::handle_newgame() {
     search_.new_game();  // joins any running search, clears history heuristics
     tt_.clear();
-    board_ = Board(chess::constants::STARTPOS);
+    set_fen(board_, chess::constants::STARTPOS);  // cannot fail
 }
+
+bool UCI::set_fen(Board& out, std::string_view fen) const {
+    Board b;
+    const bool ok = chess960_ ? b.setXfen(fen) : b.setFen(fen);
+    if (!ok) return false;
+    // The search and the NNUE index by king square; a king-less FEN would read an empty
+    // bitboard. Refuse it here instead of crashing later.
+    if (b.pieces(chess::PieceType::KING, Color::WHITE).empty() ||
+        b.pieces(chess::PieceType::KING, Color::BLACK).empty())
+        return false;
+    out = b;
+    return true;
+}
+
+namespace {
+// Stockfish's to_move: a token is accepted iff it equals the spelling of a LEGAL move in the
+// board's mode (castling is king-to-rook in 960 mode). In 960 mode a token that matches no
+// legal spelling is given a second chance as the standard g/c-file castling spelling, so a
+// GUI that sends "e1g1" for a castle still castles; a token that already names a legal king
+// step is taken as that step (first pass), exactly as Stockfish resolves it.
+Move parse_move(const Board& b, std::string tok) {
+    std::transform(tok.begin(), tok.end(), tok.begin(), [](unsigned char c) { return std::tolower(c); });
+    Movelist ml;
+    chess::movegen::legalmoves(ml, b);
+    for (const Move& m : ml)
+        if (chess::uci::moveToUci(m, b.chess960()) == tok) return m;
+    if (b.chess960())
+        for (const Move& m : ml)
+            if (m.typeOf() == Move::CASTLING && chess::uci::moveToUci(m, false) == tok) return m;
+    return Move(Move::NO_MOVE);
+}
+
+// Bulk-counted perft: the leaves are the legal-move count one ply above the horizon.
+std::uint64_t perft_count(Board& b, int depth) {
+    Movelist ml;
+    chess::movegen::legalmoves(ml, b);
+    if (depth <= 1) return static_cast<std::uint64_t>(ml.size());
+    std::uint64_t n = 0;
+    for (const Move& m : ml) {
+        b.makeMove(m);
+        n += perft_count(b, depth - 1);
+        b.unmakeMove(m);
+    }
+    return n;
+}
+}  // namespace
 
 void UCI::handle_setoption(std::istringstream& is) {
     // Grammar: setoption name <name...> [value <value...>]
@@ -208,6 +258,11 @@ void UCI::handle_setoption(std::istringstream& is) {
         move_overhead_ = std::clamp(std::stoi(value), 0, 5000);
     } else if (iequals(name, "Ponder")) {
         ponder_ = iequals(value, "true");
+    } else if (iequals(name, "UCI_Chess960")) {
+        // Takes effect at the next `position` / `gengame` (Stockfish semantics). In 960 mode
+        // castling is spoken king-to-rook ("e1h1") and FENs may carry X-FEN or Shredder
+        // castling fields; DFRC needs nothing extra (rights are per colour).
+        chess960_ = iequals(value, "true") || value == "1";
     } else if (iequals(name, "Clear Hash")) {
         search_.stop();
         search_.wait();
@@ -222,9 +277,14 @@ void UCI::handle_setoption(std::istringstream& is) {
         // Load an NNUE network on demand. Success switches to the new net; failure
         // leaves the previously loaded net untouched. The engine always has a net
         // (startup aborts if none can be loaded) and there is no HCE fallback.
-        if (nnue::load(value))
+        // Never swap the net under a running search, and drop the TT with it: its stored
+        // static evals are the OLD net's and would feed improving / pass-eval as this net's.
+        search_.stop();
+        search_.wait();
+        if (nnue::load(value)) {
+            tt_.clear();
             std::cout << "info string NNUE loaded: " << value << std::endl;
-        else
+        } else
             std::cout << "info string NNUE load FAILED: " << value << std::endl;
     } else if (iequals(name, "RootNoise")) {
         const int cp = std::clamp(std::stoi(value), 0, 200);
@@ -244,6 +304,10 @@ void UCI::handle_setoption(std::istringstream& is) {
         syzygy::set_probe_limit(std::clamp(std::stoi(value), 0, 7));
     } else if (iequals(name, "Syzygy50MoveRule")) {
         syzygy::set_fifty_rule(iequals(value, "true") || value == "1");
+    } else if (name.size() > 4 && iequals(name.substr(0, 4), "Pass")) {
+        // Pass-eval tunables (SC_PASSEVAL builds; see kPassParams in search.cpp).
+        if (set_pass_param(name, std::stoi(value)))
+            std::cout << "info string " << name << " = " << value << std::endl;
     }
     // Unknown options are silently ignored per the protocol.
 }
@@ -252,8 +316,11 @@ void UCI::handle_position(std::istringstream& is) {
     std::string token;
     is >> token;
 
+    // Build into a local board and install it at the end: an unparseable FEN leaves the
+    // current position untouched, and a bad move keeps every move applied before it.
+    Board board;
     if (token == "startpos") {
-        board_ = Board(chess::constants::STARTPOS);
+        set_fen(board, chess::constants::STARTPOS);  // cannot fail
         is >> token;  // consume optional "moves"
     } else if (token == "fen") {
         // Reassemble the six-field FEN that follows.
@@ -262,19 +329,30 @@ void UCI::handle_position(std::istringstream& is) {
             fen += token;
             fen += ' ';
         }
-        board_ = Board(fen);
+        if (!set_fen(board, fen)) {
+            std::cout << "info string position: unparseable FEN '" << fen << "' -- position unchanged"
+                      << std::endl;
+            return;
+        }
         // token now holds "moves" (or is exhausted).
     } else {
         return;  // malformed
     }
 
     if (token == "moves") {
+        int applied = 0;
         while (is >> token) {
-            const Move m = chess::uci::uciToMove(board_, token);
-            if (m == Move(Move::NO_MOVE)) break;  // stop on an unparseable move
-            board_.makeMove(m);
+            const Move m = parse_move(board, token);
+            if (m == Move(Move::NO_MOVE)) {
+                std::cout << "info string position: illegal move '" << token << "' at ply " << applied
+                          << " -- ignoring it and the rest" << std::endl;
+                break;
+            }
+            board.makeMove(m);
+            ++applied;
         }
     }
+    board_ = board;
 }
 
 void UCI::handle_go(std::istringstream& is) {
@@ -322,11 +400,12 @@ void UCI::handle_go(std::istringstream& is) {
         const Move book_move = book_.probe(board_);
         if (book_move != Move(Move::NO_MOVE)) {
             std::cout << "info string book move" << std::endl;
-            std::cout << "bestmove " << chess::uci::moveToUci(book_move) << std::endl;
+            std::cout << "bestmove " << chess::uci::moveToUci(book_move, board_.chess960()) << std::endl;
             return;
         }
     }
 
+    limits.move_overhead_ms = move_overhead_;  // the parsed `Move Overhead` option, now honoured
     search_.start(board_, limits);
 }
 
@@ -345,7 +424,8 @@ void UCI::handle_gengame(std::istringstream& is) {
     if (start == std::string::npos) { std::cout << "genend" << std::endl; return; }
     fen = fen.substr(start);
 
-    Board        board(fen);
+    Board board;
+    if (!set_fen(board, fen)) { std::cout << "genend" << std::endl; return; }
     SearchLimits limits;
     limits.depth = depth;
 
@@ -363,7 +443,7 @@ void UCI::handle_gengame(std::istringstream& is) {
         const Move bm = search_.gen_best_move();
         if (bm == Move(Move::NO_MOVE)) break;  // checkmate / stalemate at this position
         const Value sc = search_.gen_root_score();
-        out << "genply " << chess::uci::moveToUci(bm) << ' ';
+        out << "genply " << chess::uci::moveToUci(bm, board.chess960()) << ' ';
         if (is_mate_score(sc)) {  // same cp/mate form Worker::report() emits
             const int p  = (sc > 0) ? (VALUE_MATE - sc) : (VALUE_MATE + sc);
             const int mm = (sc > 0) ? (p + 1) / 2 : -((p + 1) / 2);
@@ -382,7 +462,30 @@ void UCI::handle_gengame(std::istringstream& is) {
 void UCI::handle_print() const {
     // Human-readable board dump for debugging (non-standard convenience).
     std::cout << board_ << "\nFen: " << board_.getFen() << "\nKey: " << std::hex << board_.hash()
-              << std::dec << std::endl;
+              << std::dec << "\nChess960: " << (board_.chess960() ? "true" : "false") << std::endl;
+}
+
+void UCI::handle_perft(std::istringstream& is) {
+    // perft <depth>: per-root-move leaf counts and the total, Stockfish's output shape.
+    // Debug command (blocks the UCI thread); the current position is not mutated.
+    int depth = 1;
+    is >> depth;
+    depth = std::max(1, depth);
+    Board b = board_;
+    Movelist ml;
+    chess::movegen::legalmoves(ml, b);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::uint64_t total = 0;
+    for (const Move& m : ml) {
+        b.makeMove(m);
+        const std::uint64_t n = depth > 1 ? perft_count(b, depth - 1) : 1;
+        b.unmakeMove(m);
+        std::cout << chess::uci::moveToUci(m, b.chess960()) << ": " << n << '\n';
+        total += n;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "\ninfo string perft depth " << depth << " time " << ms << " ms\nNodes searched: " << total
+              << std::endl;
 }
 
 void UCI::loop() {
@@ -408,6 +511,8 @@ void UCI::loop() {
             handle_go(is);
         } else if (command == "gengame") {
             handle_gengame(is);
+        } else if (command == "perft") {
+            handle_perft(is);
         } else if (command == "stop") {
             search_.stop();
         } else if (command == "ponderhit") {
@@ -421,6 +526,33 @@ void UCI::loop() {
             // from the side to move's perspective.
             std::cout << "static eval (stm pov): " << nnue::evaluate(board_) << " cp"
                       << std::endl;
+        } else if (command == "accsig") {
+            // Debug: for every legal move of the current position, print the L1 norm of the
+            // accumulator change it makes (item #8's signal) plus whether it is a capture, so the
+            // divisor can be set from the measured distribution of QUIET moves rather than guessed.
+            Movelist ml;
+            chess::movegen::legalmoves(ml, board_);
+            nnue::acc_reset(board_);
+            for (const auto& m : ml) {
+                nnue::acc_make(board_, m);
+                const int sig = nnue::acc_delta_l1();
+                const int thr = nnue::acc_threats_made();
+                nnue::acc_unmake();
+                std::cout << "accsig " << chess::uci::moveToUci(m, board_.chess960())
+                          << ' ' << sig << ' ' << (board_.isCapture(m) ? "cap" : "quiet")
+                          << ' ' << thr << std::endl;
+            }
+            std::cout << "accsigend" << std::endl;
+        } else if (command == "passeval") {
+            // Debug: E = static eval, P = our eval if we passed, T = E - P (tension); see
+            // nnue::evaluate_pass. Undefined in check (the passed position would be illegal).
+            const Value e = nnue::evaluate(board_);
+            if (board_.inCheck())
+                std::cout << "passeval E " << e << " P n/a T n/a (side to move in check)" << std::endl;
+            else {
+                const Value p = nnue::evaluate_pass(board_);
+                std::cout << "passeval E " << e << " P " << p << " T " << (e - p) << std::endl;
+            }
         } else if (command == "quit" || command == "exit") {
             search_.stop();
             search_.wait();

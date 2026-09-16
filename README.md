@@ -31,10 +31,31 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
   your 3-4-5 or 6-man tables.
 - **Search** — iterative-deepening alpha-beta with aspiration windows, null-move
   pruning, late-move reductions, SEE-based pruning, a transposition table,
-  killer / history / continuation move ordering, and lazy-SMP multithreading.
+  killer / history / continuation move ordering, correction history (pawn-structure,
+  weighted by an evaluation-tension signal), and lazy-SMP multithreading.
+- **Chess960 / FRC and DFRC** — set `UCI_Chess960` (GUIs and lichess-bot do it for
+  you): castling is spoken king-to-rook (`e1h1`), X-FEN and Shredder-FEN castling
+  fields are both accepted, and asymmetric (DFRC) back ranks need nothing extra.
 - **UCI** — speaks the UCI protocol; drop it into any UCI GUI (Cute Chess,
-  BanksiaGUI, En Croissant, Arena).
+  BanksiaGUI, En Croissant, Arena). Debug conveniences: `d` (board, FEN, key) and
+  `perft <depth>` (bulk-counted, Stockfish-style output).
 - Optional Polyglot opening book support — off by default; no book ships, bring your own.
+
+## Strength
+
+SimpleChess 3.2.0 is estimated at **3529 Elo on the CCRL Blitz 2'+1" 1-CPU scale** (95% interval 3501 to 3557).
+It is an estimate, not a CCRL rating: CCRL has not yet tested 3.1 or 3.2. The number comes from a 464-game
+gauntlet against 29 engines with published CCRL ratings, from Stockfish 19 (3784) down to c4ke 3.0 (3303), each
+the exact CCRL-tested version and each held at its CCRL 1-CPU rating while 3.2's rating was fitted with BayesElo's
+model at its default settings, on CCRL's printed scale. SimpleChess scored +162 =133 -169 (49.2%) against an
+average opponent of 3533.
+
+Conditions: 120000 ms + 1000 ms per move on a wall clock; every engine at Threads 1 with 256 MB hash, fresh
+processes each game; one CPU core per game on an Intel i7-9700; ponder, opening books and tablebases off; no
+adjudication (games end only by mate, stalemate, repetition, the fifty-move rule, insufficient material, time or an
+illegal move); 16 games per opponent from the same 8 UHO 2024 (Unbalanced Human Openings) 8-move lines, each played
+with both colours. Full method, opponent versions, openings and per-opponent results are in the
+[changelog](CHANGELOG.md) under v3.2.0.
 
 ## Build
 
@@ -50,7 +71,7 @@ make clean
 For the fastest (shipping) binary, use the profile-guided build:
 
 ```sh
-make profile-build PGO_NET=nets/SCNNUEv3-2026-08-30.scn5
+make profile-build PGO_NET=nets/SCNNUEv3-2026-09-12.scn5
 ```
 
 The release build uses `-O3 -flto -mcpu=native`; retarget the architecture with,
@@ -87,6 +108,7 @@ Point the `EvalFile` option at another file to use a different network.
 | `Threads` | 8 | search threads (lazy SMP) |
 | `Move Overhead` | 30 | ms reserved for GUI / network lag |
 | `Ponder` | false | think on the opponent's clock |
+| `UCI_Chess960` | false | Chess960 / FRC / DFRC: castling moves are sent and received king-to-rook (`e1h1`); FENs may carry X-FEN (`KQkq`) or Shredder (`HAha`) castling fields |
 | `OwnBook` | false | opt in to a Polyglot book (none ships) |
 | `Book File` | *(none)* | path to a Polyglot book, if you supply one |
 | `EvalFile` | *(newest `SCNNUEv3-<date>.scn5`)* | network file to load |
@@ -98,7 +120,7 @@ Point the `EvalFile` option at another file to use a different network.
 
 ## The network
 
-`nets/SCNNUEv3-2026-08-30.scn5` is the pre-quantized int8 playing network (file
+`nets/SCNNUEv3-2026-09-12.scn5` is the pre-quantized int8 playing network (file
 magic `SCN5`), committed to the repo so the engine works immediately after a
 clone or "Download ZIP." Nets are named `SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5`
 (engine major + export date) and the engine loads the newest one it finds; the
