@@ -82,6 +82,14 @@ any AVX2 machine (Haswell or newer) use `make ARCH="-march=x86-64-v3"`.
 [python-chess](https://pypi.org/project/chess/) (`pip install chess`) for its
 training workload. A `CMakeLists.txt` is provided for IDE / CMake users.
 
+**Android (arm64).** The repository's GitHub Actions workflow
+(`.github/workflows/android.yml`) cross-compiles a fully static build for 64-bit
+Android phones — for DroidFish or any other UCI front-end — on every release tag and
+on demand. Open the *Android build* run under the Actions tab and download
+`simplechess-<version>-android-arm64.tar.gz` (or `-arm64-generic` for SoCs older
+than about 2018, which lack the Arm dot-product extension); the archive holds the
+binary, the network and install notes.
+
 ## Run
 
 ```sh
@@ -108,6 +116,7 @@ Point the `EvalFile` option at another file to use a different network.
 | `Threads` | 8 | search threads (lazy SMP) |
 | `Move Overhead` | 30 | ms reserved for GUI / network lag |
 | `Ponder` | false | think on the opponent's clock |
+| `MultiPV` | 1 | principal variations to report, best first (analysis; 1 = normal play) |
 | `UCI_Chess960` | false | Chess960 / FRC / DFRC: castling moves are sent and received king-to-rook (`e1h1`); FENs may carry X-FEN (`KQkq`) or Shredder (`HAha`) castling fields |
 | `OwnBook` | false | opt in to a Polyglot book (none ships) |
 | `Book File` | *(none)* | path to a Polyglot book, if you supply one |

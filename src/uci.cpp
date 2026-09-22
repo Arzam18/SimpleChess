@@ -144,6 +144,7 @@ void UCI::handle_uci() const {
               << " min 1 max " << Search::kMaxThreads << "\n";
     std::cout << "option name Move Overhead type spin default 30 min 0 max 5000\n";
     std::cout << "option name Ponder type check default false\n";
+    std::cout << "option name MultiPV type spin default 1 min 1 max " << MAX_MOVES << "\n";
     std::cout << "option name UCI_Chess960 type check default false\n";
     std::cout << "option name Clear Hash type button\n";
     std::cout << "option name OwnBook type check default false\n";
@@ -162,7 +163,7 @@ void UCI::handle_uci() const {
 #define SC_STR(x) SC_STR_(x)
     std::cout << "option name BuildTag type string default " << SC_STR(SC_BUILD_TAG) << "\n";
 #endif
-    pass_param_options(std::cout);  // Pass* tunables, advertised only in SC_PASSEVAL builds
+    pass_param_options(std::cout);  // Pass* tunables: dev knobs, advertised only in SC_PASS_UCI_OPTIONS builds
     std::cout << "uciok" << std::endl;
 }
 
@@ -188,11 +189,11 @@ bool UCI::set_fen(Board& out, std::string_view fen) const {
 }
 
 namespace {
-// Stockfish's to_move: a token is accepted iff it equals the spelling of a LEGAL move in the
+// Move parsing: a token is accepted iff it equals the spelling of a LEGAL move in the
 // board's mode (castling is king-to-rook in 960 mode). In 960 mode a token that matches no
 // legal spelling is given a second chance as the standard g/c-file castling spelling, so a
 // GUI that sends "e1g1" for a castle still castles; a token that already names a legal king
-// step is taken as that step (first pass), exactly as Stockfish resolves it.
+// step is taken as that step (first pass).
 Move parse_move(const Board& b, std::string tok) {
     std::transform(tok.begin(), tok.end(), tok.begin(), [](unsigned char c) { return std::tolower(c); });
     Movelist ml;
@@ -258,8 +259,11 @@ void UCI::handle_setoption(std::istringstream& is) {
         move_overhead_ = std::clamp(std::stoi(value), 0, 5000);
     } else if (iequals(name, "Ponder")) {
         ponder_ = iequals(value, "true");
+    } else if (iequals(name, "MultiPV")) {
+        // Principal variations to report; clamped to the legal-move count at search time.
+        multipv_ = std::clamp(std::stoi(value), 1, MAX_MOVES);
     } else if (iequals(name, "UCI_Chess960")) {
-        // Takes effect at the next `position` / `gengame` (Stockfish semantics). In 960 mode
+        // Takes effect at the next `position` / `gengame` (lazy, as GUIs expect). In 960 mode
         // castling is spoken king-to-rook ("e1h1") and FENs may carry X-FEN or Shredder
         // castling fields; DFRC needs nothing extra (rights are per colour).
         chess960_ = iequals(value, "true") || value == "1";
@@ -406,6 +410,7 @@ void UCI::handle_go(std::istringstream& is) {
     }
 
     limits.move_overhead_ms = move_overhead_;  // the parsed `Move Overhead` option, now honoured
+    limits.multipv          = multipv_;        // principal variations to report
     search_.start(board_, limits);
 }
 
@@ -466,7 +471,7 @@ void UCI::handle_print() const {
 }
 
 void UCI::handle_perft(std::istringstream& is) {
-    // perft <depth>: per-root-move leaf counts and the total, Stockfish's output shape.
+    // perft <depth>: per-root-move leaf counts and the total, in the shape perft tools expect.
     // Debug command (blocks the UCI thread); the current position is not mutated.
     int depth = 1;
     is >> depth;

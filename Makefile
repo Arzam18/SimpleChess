@@ -141,11 +141,14 @@ profile-build:
 	         LDFLAGS="$(LDFLAGS) -fprofile-use=$(PGO_ABS)/prof.profdata" all
 	@echo ">> PGO build complete: ./$(EXE)"
 
-# ---- Versioning convenience wrappers (dev tree only: need tools/release/version.py) ----
-ifneq ($(wildcard tools/release/version.py),)
 version:
 	@echo "Simple Chess $(VERSION)"
 
+clean:
+	@rm -rf build build-debug simplechess simplechess-debug
+
+# ---- Versioning convenience wrappers (dev tree only: need tools/release/version.py) ----
+ifneq ($(wildcard tools/release/version.py),)
 save:
 	@python3 tools/release/version.py save $(NAME) $(if $(MSG),-m "$(MSG)",)
 
@@ -157,9 +160,6 @@ restore:
 
 versions:
 	@python3 tools/release/version.py list
-
-clean:
-	@rm -rf build build-debug simplechess simplechess-debug
+endif
 
 -include $(DEPS)
-endif

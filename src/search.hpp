@@ -65,6 +65,12 @@
 #ifndef SC_PASSEVAL_VERIFY
 #define SC_PASSEVAL_VERIFY 0
 #endif
+// The Pass* tunables are development knobs, not user options: they are never advertised in
+// the `uci` option list unless a tuning build sets SC_PASS_UCI_OPTIONS=1. setoption still
+// accepts them silently either way, so the match tooling can drive them (--set PassX=...).
+#ifndef SC_PASS_UCI_OPTIONS
+#define SC_PASS_UCI_OPTIONS 0
+#endif
 // Compile-time defaults of the tunables (each experiment builds with ITS values as defaults so the
 // PGO profile and the played configuration agree; UCI setoption only serves alternates).
 #ifndef SC_PASS_MINDEPTH
@@ -131,6 +137,31 @@
 #ifndef SC_THRSIG_MIN
 #define SC_THRSIG_MIN 1
 #endif
+// 50-move-rule static-eval damping: scale the fresh static eval toward zero in proportion to the
+// halfmove clock, so a position shuffling toward the 50-move draw stops reporting a full advantage
+// it can no longer force. `eval -= eval * halfmove_clock / 199` (roughly halved at clock 100, the
+// draw threshold; 0 only at 199, which real play never reaches). Applied ONLY to a freshly computed
+// net eval, never to a value reused from the TT (that value was already damped when written -- damping
+// it again would double-damp on transpositions). Shipped on by default (+4 Elo [-2,+10], LOS 89% over
+// 1881 pairs at 10+0.1 -- a small, correctness-motivated gain); set to 0 to restore the old behaviour.
+#ifndef SC_R50DAMP
+#define SC_R50DAMP 1
+#endif
+// 50-move-rule mate reclassification: a mate score read back from the transposition table is only
+// real if the mating side can actually deliver it before the 50-move draw resets the game. When the
+// reported distance to mate exceeds the plies the halfmove clock still allows (100 - clock), the mate
+// is unreachable, so downgrade it to a high but non-mate score (VALUE_TB_WIN_IN_MAX_PLY - 1) -- the
+// search keeps treating the position as winning but stops trusting, extending, and reporting a forced
+// mate it cannot force. Scoped strictly to the mate band (>= VALUE_MATE_IN_MAX_PLY): tablebase-band
+// scores are never cached in the TT here (the WDL probe returns before the store), so they cannot
+// reach this path and are intentionally left untouched. Shipped on by default as a correctness fix:
+// SPRT was neutral at fast TC (+1 [-3,+5], LOS 69%, no regression over 3000 pairs) because the node
+// cost of surrendering false-mate cutoffs cancels the benefit there, but the engine no longer reports
+// or chases a mate the 50-move rule voids, and the payoff is a long-TC/endgame property the fast test
+// cannot see. Set to 0 to restore the plain ply de-shift.
+#ifndef SC_R50MATE
+#define SC_R50MATE 1
+#endif
 #include "types.hpp"
 
 namespace engine {
@@ -146,8 +177,8 @@ void set_root_noise(int cp);
 void set_gen_silent(bool silent);
 
 // Pass-eval tunables (inert unless SC_PASSEVAL). set_pass_param returns false for an unknown
-// name (case-insensitive) and clamps to the advertised range; pass_param_options prints the
-// `option name ...` lines (nothing when SC_PASSEVAL == 0).
+// name (case-insensitive) and clamps to the tunable's range; pass_param_options prints the
+// `option name ...` lines only in SC_PASS_UCI_OPTIONS tuning builds (they are not user options).
 bool set_pass_param(std::string_view name, int value);
 void pass_param_options(std::ostream& out);
 
@@ -162,6 +193,36 @@ struct Stack {
     int   moved_to     = 0;                    // destination square of current_move
     Value static_eval  = VALUE_NONE;           // static eval at this node (NONE in check)
     int   ply          = 0;
+};
+
+// One legal root move and what the current search knows about it (MultiPV, 3.3).
+// `score` is -VALUE_INFINITE for every root move except the PV
+// line(s) found so far this iteration, so a STABLE descending sort moves only the new PV to
+// the front and keeps every other move's order. `uci_score` is what the info line prints:
+// the fail-soft score clipped to the aspiration bound it hit, with the matching inexact_*
+// flag set so the line can be tagged lowerbound/upperbound.
+struct RootMove {
+    explicit RootMove(Move m) : move(m) { pv[0] = m; pv_len = 1; }
+    bool operator==(Move m) const noexcept { return move == m; }
+    // Sort descending: better score first, ties by the previous iteration's score.
+    bool operator<(const RootMove& o) const noexcept {
+        return o.score != score ? o.score < score : o.prev_score < prev_score;
+    }
+    [[nodiscard]] bool is_inexact() const noexcept { return inexact_lower || inexact_upper; }
+    void unset_inexact() noexcept { inexact_lower = inexact_upper = false; }
+
+    Move  move;
+    Value score            = -VALUE_INFINITE;
+    Value prev_score       = -VALUE_INFINITE;
+    Value uci_score        = -VALUE_INFINITE;
+    bool  inexact_lower    = false;
+    bool  inexact_upper    = false;
+    bool  prev_score_exact = false;
+    int   seldepth         = 0;
+    std::array<Move, MAX_PLY + 1> pv{};
+    int                            pv_len = 0;
+    std::array<Move, MAX_PLY + 1> prev_pv{};
+    int                            prev_pv_len = 0;
 };
 
 // One search thread's private world. Everything mutable during a search lives
@@ -189,10 +250,8 @@ class Worker {
     // node and hard-time limits for everyone.
     [[nodiscard]] bool should_stop();
 
-    // Emit one UCI `info` line for a completed iteration (main worker only).
-    void report(Depth depth, Value score);
-
-    [[nodiscard]] std::string pv_string() const;
+    // Emit the UCI `info` lines for a completed iteration, one per PV line (main worker only).
+    void report_multipv(Depth depth);
 
     Search& pool_;
     int     id_;
@@ -224,6 +283,14 @@ class Worker {
     std::array<Move, MAX_MOVES>          root_mv_{};
     std::array<std::uint64_t, MAX_MOVES> root_cost_{};
     int                                  root_n_ = 0;
+
+    // MultiPV (3.3): one RootMove per legal root move, kept
+    // sorted so the PV lines found this iteration lead; pv_idx_ is the line being
+    // searched and multipv_ the effective line count, min(MultiPV, #legal). At MultiPV 1
+    // every pv_idx_ gate in the search is inert and the node sequence is unchanged.
+    std::vector<RootMove> root_moves_;
+    int                   pv_idx_  = 0;
+    int                   multipv_ = 1;
 
     // Snapshot of the pool's search width, taken once per ID iteration so the
     // widening is stable within an iteration.

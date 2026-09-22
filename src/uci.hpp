@@ -65,7 +65,8 @@ class UCI {
     bool        ponder_        = false; // "Ponder"
     bool        own_book_      = false; // "OwnBook" — opt-in; no book ships or loads by default
     bool        chess960_      = false; // "UCI_Chess960" — read by the NEXT position/gengame
-                                        // (lazy, like Stockfish); never re-sets the current board
+                                        // (lazy, as GUIs expect); never re-sets the current board
+    int         multipv_       = 1;     // "MultiPV" — principal variations to report (analysis)
 };
 
 }  // namespace engine

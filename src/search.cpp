@@ -108,10 +108,14 @@ bool set_pass_param(std::string_view name, int value) {
 }
 
 void pass_param_options(std::ostream& out) {
-    if constexpr (SC_PASSEVAL)
+    // Development knobs, not user options: advertised only in SC_PASS_UCI_OPTIONS tuning builds.
+    // setoption accepts them regardless (see set_pass_param), so the match tooling can drive them.
+    if constexpr (SC_PASSEVAL && SC_PASS_UCI_OPTIONS)
         for (const auto& p : kPassParams)
             out << "option name " << p.name << " type spin default " << p.def
                 << " min " << p.lo << " max " << p.hi << "\n";
+    else
+        (void)out;
 }
 
 void set_root_noise(int cp) { g_root_noise.store(cp < 0 ? 0 : cp, std::memory_order_relaxed); }
@@ -217,8 +221,8 @@ constexpr Value kBreadthGapRange   = 80;   // gap signal fades to 0 here (cp)
 constexpr Value kBreadthScoreRange = 200;  // score signal fades to 0 here (cp)
 // The old third factor (middlegame-ness, "endings = deep") was DROPPED in 3.2:
 // it forced width to 0 from ~Q+R each side on, so every endgame ran the
-// narrowest tree — neither Stockfish nor Reckless has any material term in its
-// reductions. See dev-notes/campaigns/search-3.2.
+// narrowest tree — the strongest engines carry no material term in their
+// reductions at all. See dev-notes/campaigns/search-3.2.
 constexpr Depth kBreadthMinDepth   = 6;    // trust the root gap only from this iteration on
 
 // Late-move-reduction table, indexed [depth][move number]; log-shaped.
@@ -231,11 +235,21 @@ const auto kLmr = [] {
     return t;
 }();
 
-// Convert a TT-stored (root-relative) mate score back to node-relative at `ply`.
-[[nodiscard]] Value tt_value_from(std::int16_t stored, int ply) noexcept {
+// Convert a TT-stored (root-relative) mate score back to node-relative at `ply`. `r50c` is the
+// position's halfmove clock; with SC_R50MATE it downgrades a mate the 50-move rule voids before it
+// can be delivered (see the switch comment in search.hpp). r50c is unused when the switch is off.
+[[nodiscard]] Value tt_value_from(std::int16_t stored, int ply, [[maybe_unused]] int r50c) noexcept {
     Value v = stored;
-    if (v >= VALUE_MATE_IN_MAX_PLY) return v - ply;
-    if (v <= VALUE_MATED_IN_MAX_PLY) return v + ply;
+    if (v >= VALUE_MATE_IN_MAX_PLY) {
+        if constexpr (SC_R50MATE)
+            if (VALUE_MATE - (v - ply) > 100 - r50c) return VALUE_TB_WIN_IN_MAX_PLY - 1;
+        return v - ply;
+    }
+    if (v <= VALUE_MATED_IN_MAX_PLY) {
+        if constexpr (SC_R50MATE)
+            if (VALUE_MATE + (v + ply) > 100 - r50c) return VALUE_TB_LOSS_IN_MAX_PLY + 1;
+        return v + ply;
+    }
     return v;
 }
 
@@ -401,6 +415,8 @@ void Worker::new_search() {
     root_second_ = -VALUE_INFINITE;
     root_n_      = 0;
     root_tension_ = VALUE_NONE;
+    pv_idx_       = 0;
+    multipv_      = 1;
     pv_len_.fill(0);
 }
 
@@ -459,7 +475,7 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
     Bound         tt_bound = Bound::NONE;
     if (probe.hit) {
         tt_move  = Move(probe.entry->move16);
-        tt_value = tt_value_from(probe.entry->value, ss->ply);
+        tt_value = tt_value_from(probe.entry->value, ss->ply, static_cast<int>(board.halfMoveClock()));
         tt_eval  = probe.entry->eval;
         tt_bound = probe.entry->bound();
 
@@ -472,7 +488,13 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
     if (in_check) {
         best = -VALUE_INFINITE;
     } else {
-        raw_eval = (probe.hit && tt_eval != VALUE_NONE) ? tt_eval : nnue::evaluate(board);
+        if (probe.hit && tt_eval != VALUE_NONE) {
+            raw_eval = tt_eval;  // reuse the stored static eval as-is (already damped when written)
+        } else {
+            raw_eval = nnue::evaluate(board);
+            if constexpr (SC_R50DAMP)
+                raw_eval -= raw_eval * static_cast<int>(board.halfMoveClock()) / 199;
+        }
         best     = raw_eval;
         if constexpr (SC_PASSEVAL) {
             // Null-move-consistent stand-pat: P (our eval if we passed) is the conservative bound
@@ -630,7 +652,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     Bound tt_bound = Bound::NONE;
     if (probe.hit) {
         tt_move  = Move(probe.entry->move16);
-        tt_value = tt_value_from(probe.entry->value, ss->ply);
+        tt_value = tt_value_from(probe.entry->value, ss->ply, static_cast<int>(board.halfMoveClock()));
         tt_eval  = probe.entry->eval;
         tt_depth = probe.entry->depth;
         tt_bound = probe.entry->bound();
@@ -669,7 +691,13 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     Value raw_eval = VALUE_NONE;  // pure static eval — this is what goes into the TT
     Value eval     = VALUE_NONE;  // corrected + possibly TT-sharpened — drives pruning
     if (!in_check) {
-        raw_eval = (probe.hit && tt_eval != VALUE_NONE) ? tt_eval : nnue::evaluate(board);
+        if (probe.hit && tt_eval != VALUE_NONE) {
+            raw_eval = tt_eval;  // reuse the stored static eval as-is (already damped when written)
+        } else {
+            raw_eval = nnue::evaluate(board);
+            if constexpr (SC_R50DAMP)
+                raw_eval -= raw_eval * static_cast<int>(board.halfMoveClock()) / 199;
+        }
         // Fold in the learned per-pawn-structure correction. The corrected value
         // is what `improving` and the pruning heuristics see, and what the update
         // at the node's tail measures its residual against — a feedback loop that
@@ -873,6 +901,9 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         if (pass_[PASS_LMR_DIV] > 0 && depth >= 2) need_tension();
     OrderingContext ctx;
     ctx.tt_move     = tt_move;
+    // MultiPV: search the current PV line's move first. Line 0 keeps the TT-probe
+    // move, so the default search orders exactly as before.
+    if (root && pv_idx_ > 0) ctx.tt_move = root_moves_[static_cast<std::size_t>(pv_idx_)].move;
     ctx.killer0     = ss->killers[0];
     ctx.killer1     = ss->killers[1];
     ctx.stm         = static_cast<int>(board.sideToMove());
@@ -889,8 +920,10 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     int   move_count  = 0;
     bool  skip_quiets = false;
 
-    if (root) root_second_ = -VALUE_INFINITE;  // reset per-iteration 2nd-best tracker
-    if (root) root_n_      = 0;                // reset per-iteration effort tracker
+    // MultiPV: only the first line resets these -- a later line's root search must not
+    // wipe line 0's second-best and effort shares, which the time manager reads afterwards.
+    if (root && pv_idx_ == 0) root_second_ = -VALUE_INFINITE;  // reset per-iteration 2nd-best tracker
+    if (root && pv_idx_ == 0) root_n_      = 0;                // reset per-iteration effort tracker
 
     // Moves actually searched, for history maluses after a cutoff.
     Move tried_quiets[64];
@@ -900,6 +933,15 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     Move m;
     while ((m = picker.next(skip_quiets)) != Move(Move::NO_MOVE)) {
         if (m == excluded) continue;
+
+        // MultiPV: at the root skip the PV lines already found this iteration, before
+        // they can count toward move_count.
+        if (root && pv_idx_ > 0) {
+            bool searched = false;
+            for (int k = 0; k < pv_idx_; ++k)
+                if (root_moves_[static_cast<std::size_t>(k)].move == m) { searched = true; break; }
+            if (searched) continue;
+        }
 
         const bool quiet       = is_quiet(board, m);
         const bool capture     = board.isCapture(m);
@@ -1107,7 +1149,8 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             tried_caps[n_caps++] = m;
 
         // Charge this move's subtree to it, for the time manager's effort share.
-        if (root && root_n_ < MAX_MOVES) {
+        // MultiPV: line 0 only (the time manager reads line 0's shares).
+        if (root && pv_idx_ == 0 && root_n_ < MAX_MOVES) {
             root_mv_[root_n_]   = m;
             root_cost_[root_n_] = nodes_.load(std::memory_order_relaxed) - nodes_before;
             ++root_n_;
@@ -1116,11 +1159,42 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         // Track the best score among non-best root moves (fail-soft, so it's a
         // true upper bound on each): when a new best appears the old best is
         // demoted to second; otherwise this move itself is a second candidate.
-        if (root) {
+        // MultiPV: line 0 only -- the time manager and the width read it, and a
+        // later line's "second best" is meaningless to them.
+        if (root && pv_idx_ == 0) {
             if (score > best) {
                 if (best > root_second_) root_second_ = best;
             } else if (score > root_second_) {
                 root_second_ = score;
+            }
+        }
+
+        // MultiPV bookkeeping, separate from the search's own
+        // best/alpha/pv_ state: the new best of this line records its score (clipped to
+        // the bound it hit, flagged inexact) and PV; every other root move drops to
+        // -VALUE_INFINITE so the stable sort in think() moves only the PV to the front.
+        if (root) {
+            auto it = std::find(root_moves_.begin(), root_moves_.end(), m);
+            if (it != root_moves_.end()) {
+                RootMove& rm = *it;
+                if (move_count == 1 || score > alpha) {
+                    rm.score = rm.uci_score = score;
+                    rm.unset_inexact();
+                    if (score >= beta) {
+                        rm.inexact_lower = true;
+                        rm.uci_score     = beta;
+                    } else if (score <= alpha) {
+                        rm.inexact_upper = true;
+                        rm.uci_score     = alpha;
+                    }
+                    rm.pv[0] = m;
+                    std::copy(pv_[ss->ply + 1].begin(),
+                              pv_[ss->ply + 1].begin() + pv_len_[ss->ply + 1],
+                              rm.pv.begin() + 1);
+                    rm.pv_len = pv_len_[ss->ply + 1] + 1;
+                } else {
+                    rm.score = -VALUE_INFINITE;
+                }
             }
         }
 
@@ -1139,7 +1213,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                     pv_len_[ss->ply] = pv_len_[ss->ply + 1] + 1;
                 }
 
-                if (root) best_move_ = m;
+                if (root && pv_idx_ == 0) best_move_ = m;
 
                 if (score >= beta) break;  // fail-high
                 alpha = score;
@@ -1162,7 +1236,10 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         const Bound bound = best >= beta                             ? Bound::LOWER
                             : (pv_node && best_move != Move(Move::NO_MOVE)) ? Bound::EXACT
                                                                             : Bound::UPPER;
-        pool_.tt_.store(key, best, raw_eval, bound, depth, best_move, ss->ply, pv_node);
+        // MultiPV: a non-first PV line must not overwrite the root entry, which holds the
+        // true best.
+        if (!(root && pv_idx_ > 0))
+            pool_.tt_.store(key, best, raw_eval, bound, depth, best_move, ss->ply, pv_node);
 
         if constexpr (SC_CORRHIST) {
             // Teach the pawn-structure bucket the gap between the corrected static
@@ -1299,7 +1376,14 @@ void Worker::think() {
         (pool_.limits_.depth > 0) ? std::min<Depth>(pool_.limits_.depth, MAX_PLY - 1)
                                   : MAX_PLY - 1;
 
-    Value prev_score = VALUE_NONE;
+    // MultiPV (3.3): one RootMove per legal move, in
+    // generation order; the effective line count is clamped to the legal-move count.
+    root_moves_.clear();
+    root_moves_.reserve(root_moves.size());
+    for (const auto& rm : root_moves) root_moves_.emplace_back(rm);
+    multipv_ = std::clamp<int>(pool_.limits_.multipv, 1, static_cast<int>(root_moves_.size()));
+
+    Value prev_score = VALUE_NONE;  // line 0's score at the last completed iteration
     Move  prev_best  = Move(Move::NO_MOVE);
     int   stable     = 0;  // consecutive completed iterations with the same best move
 
@@ -1314,46 +1398,126 @@ void Worker::think() {
         width_    = pool_.width_.load(std::memory_order_relaxed);  // stable per iteration
         if constexpr (SC_PASSEVAL)   // one consistent tunable set per iteration (see kPassParams)
             for (int i = 0; i < PASS_N; ++i) pass_[i] = g_pass[i].load(std::memory_order_relaxed);
-        seldepth_ = 0;
 
-        // ---- Aspiration windows ----
-        // Search a narrow window around the previous score, widening
-        // geometrically on failure. Small windows produce far more cutoffs.
-        Value delta = kAspirationDelta;
-        Value alpha = -VALUE_INFINITE, beta = VALUE_INFINITE;
-        if (d >= 4 && prev_score != VALUE_NONE) {
-            alpha = std::max<Value>(prev_score - delta, -VALUE_INFINITE);
-            beta  = std::min<Value>(prev_score + delta, VALUE_INFINITE);
+        // Save the last iteration's scores and PVs before the first line is searched and
+        // every non-PV score is reset to -VALUE_INFINITE.
+        for (std::size_t i = 0; i < root_moves_.size(); ++i) {
+            RootMove& rm        = root_moves_[i];
+            rm.prev_score       = rm.score;
+            rm.prev_pv          = rm.pv;
+            rm.prev_pv_len      = rm.pv_len;
+            rm.prev_score_exact = static_cast<int>(i) < multipv_;
         }
 
-        Value score;
-        while (true) {
-            score = negamax(board, ss, d, alpha, beta, false);
-            if (pool_.stop_.load(std::memory_order_relaxed)) break;
+        // ---- MultiPV loop: one full root search per PV line ----
+        bool stopped = false;
+        for (pv_idx_ = 0; pv_idx_ < multipv_; ++pv_idx_) {
+            seldepth_ = 0;  // per line
 
-            if (score <= alpha) {  // fail-low: drop alpha, pull beta toward it
-                beta  = (alpha + beta) / 2;
-                alpha = std::max<Value>(score - delta, -VALUE_INFINITE);
-            } else if (score >= beta) {  // fail-high: raise beta
-                beta = std::min<Value>(score + delta, VALUE_INFINITE);
-            } else {
+            // ---- Aspiration windows ----
+            // Search a narrow window around THIS line's previous score, widening
+            // geometrically on failure. Small windows produce far more cutoffs. At
+            // MultiPV 1 the centre is exactly the old prev_score: line 0's score after
+            // the sort is the returned fail-soft best.
+            const Value centre = root_moves_[static_cast<std::size_t>(pv_idx_)].prev_score;
+            Value delta = kAspirationDelta;
+            Value alpha = -VALUE_INFINITE, beta = VALUE_INFINITE;
+            if (d >= 4 && centre != -VALUE_INFINITE) {
+                alpha = std::max<Value>(centre - delta, -VALUE_INFINITE);
+                beta  = std::min<Value>(centre + delta, VALUE_INFINITE);
+            }
+
+            Value v;
+            while (true) {
+                v = negamax(board, ss, d, alpha, beta, false);
+                // Bring this line's best to the front of the unsearched tail. Stable, so
+                // every other root move keeps its order.
+                std::stable_sort(root_moves_.begin() + pv_idx_, root_moves_.end());
+                if (pool_.stop_.load(std::memory_order_relaxed)) break;
+
+                if (v <= alpha) {  // fail-low: drop alpha, pull beta toward it
+                    beta  = (alpha + beta) / 2;
+                    alpha = std::max<Value>(v - delta, -VALUE_INFINITE);
+                } else if (v >= beta) {  // fail-high: raise beta
+                    beta = std::min<Value>(v + delta, VALUE_INFINITE);
+                } else {
+                    break;
+                }
+                delta += delta / 2;
+            }
+            // This line's selective depth: its maximum, taken at the end of its search
+            // (freezing it when the PV move is recorded would under-report).
+            root_moves_[static_cast<std::size_t>(pv_idx_)].seldepth = seldepth_;
+
+            if (pool_.stop_.load(std::memory_order_relaxed)) {
+                stopped = true;
+                if (pv_idx_ > 0) {
+                    // An aborted search must not spoil a completed earlier line: never let it
+                    // overtake a proven-loss pv_idx_-1, and never trust an exact loss from an
+                    // aborted search.
+                    RootMove& cur  = root_moves_[static_cast<std::size_t>(pv_idx_)];
+                    RootMove& prev = root_moves_[static_cast<std::size_t>(pv_idx_ - 1)];
+                    auto is_loss = [](Value s) noexcept {
+                        return s != -VALUE_INFINITE && s <= VALUE_TB_LOSS_IN_MAX_PLY;
+                    };
+                    auto exact_loss = [&](const RootMove& r) { return is_loss(r.score) && !r.is_inexact(); };
+                    if ((is_loss(prev.score) && cur < prev) || exact_loss(cur)) {
+                        if (cur.prev_score != -VALUE_INFINITE && cur.prev_score_exact &&
+                            cur.prev_score <= prev.score) {
+                            // The exact previous score is safe to show; it cannot overtake prev.
+                            cur.score = cur.uci_score = cur.prev_score;
+                            cur.prev_score = -VALUE_INFINITE;
+                            cur.pv         = cur.prev_pv;
+                            cur.pv_len     = cur.prev_pv_len;
+                            cur.unset_inexact();
+                        } else {
+                            // Cap to the best possible and mark the score inexact.
+                            if (is_loss(prev.score)) {
+                                cur.score = cur.uci_score = prev.score;
+                                cur.prev_score    = -VALUE_INFINITE;
+                                cur.pv_len        = 1;
+                                cur.inexact_upper = true;
+                            } else {
+                                cur.inexact_upper = false;
+                            }
+                            cur.inexact_lower = !cur.inexact_upper;
+                        }
+                    }
+                    for (int i = pv_idx_ + 1; i < multipv_; ++i) {
+                        RootMove& r = root_moves_[static_cast<std::size_t>(i)];
+                        if (exact_loss(r)) r.inexact_lower = true;
+                    }
+                }
                 break;
             }
-            delta += delta / 2;
-        }
 
-        if (pool_.stop_.load(std::memory_order_relaxed)) break;
+            // Sort the lines searched so far.
+            std::stable_sort(root_moves_.begin(), root_moves_.begin() + pv_idx_ + 1);
+        }
+        if (stopped) break;
 
         completed_ = d;
-        prev_score = score;
+        // The iteration's score is line 0's: what time management, the width, gengame and
+        // the effort trim read (at MultiPV 1 exactly the returned fail-soft best). The mate
+        // stop is judged on the LAST line so a proven mate on line 0 does not cut the other
+        // lines short; at MultiPV 1 that is line 0.
+        const Value score      = root_moves_[0].score;
+        const Value stop_score = root_moves_[static_cast<std::size_t>(multipv_ - 1)].score;
+        prev_score             = score;
+        // The move to play is the sorted top line.
+        // At MultiPV 1 this is the move line 0 just found, so nothing changes; at MultiPV > 1
+        // a later line, searched with its own full window, can out-score line 0 (line 0 may
+        // have dropped that move on a reduced null-window fail-low), and the sort has it.
+        best_move_ = root_moves_[0].move;
 
         if (!main_worker) continue;  // helpers never report or manage time
 
-        report(d, score);
+        report_multipv(d);
 
-        // The 2nd move of the root PV is the reply we expect; offer it as the
-        // ponder move so the GUI can search it on the opponent's clock.
-        ponder_move_ = (pv_len_[0] >= 2) ? pv_[0][1] : Move(Move::NO_MOVE);
+        // The 2nd move of line 0's PV is the reply we expect; offer it as the ponder
+        // move so the GUI can search it on the opponent's clock. (pv_[0] holds the LAST
+        // line's PV once the loop has run, so it can no longer serve here.)
+        ponder_move_ = (root_moves_[0].pv_len >= 2) ? root_moves_[0].pv[1] : Move(Move::NO_MOVE);
 
         // Best-move stability across completed iterations (for the only-move exit).
         stable    = (best_move_ == prev_best) ? stable + 1 : 0;
@@ -1394,14 +1558,16 @@ void Worker::think() {
         if (pool_.budget_.use_clock) {
             if (root_moves.size() == 1 && d >= 6) {
                 break;                                       // forced move: nothing to choose
-            } else if (is_mate_score(score)) {
+            } else if (is_mate_score(stop_score)) {
                 // Stop only once the mate is proven SHORTEST at this depth. A mate
                 // whose distance still exceeds the searched depth is a TT-injected long
                 // mate from an earlier search: breaking on it plays a "mates eventually"
                 // move and abandons the rest of the budget instead of deepening to the
                 // quickest mate. Requiring d >= distance still caps ponder spins (it
                 // fires the moment the mate is genuinely proven, not on a stale TT hit).
-                const int mate_plies = (score > 0) ? (VALUE_MATE - score) : (VALUE_MATE + score);
+                // MultiPV: judged on the LAST line (see stop_score above).
+                const int mate_plies = (stop_score > 0) ? (VALUE_MATE - stop_score)
+                                                        : (VALUE_MATE + stop_score);
                 if (d >= mate_plies) break;                  // shortest mate proven: play it
             }
         }
@@ -1510,44 +1676,59 @@ void Worker::think() {
 
 // ---- Reporting ----------------------------------------------------------------
 
-std::string Worker::pv_string() const {
-    std::ostringstream ss;
-    for (int i = 0; i < pv_len_[0]; ++i) {
-        if (i) ss << ' ';
-        ss << chess::uci::moveToUci(pv_[0][i], pool_.root_.chess960());
-    }
-    return ss.str();
-}
-
-void Worker::report(Depth depth, Value score) {
+// One `info` line per PV line. A line not reached this iteration
+// (score == -VALUE_INFINITE) is shown at depth-1 from its previous score and PV; a line
+// whose search stopped on an aspiration bound carries lowerbound/upperbound.
+void Worker::report_multipv(Depth depth) {
     if (g_gen_silent) return;  // gengame: suppress per-iteration info lines
     const std::int64_t  ms    = std::max<std::int64_t>(1, elapsed_ms(pool_.start_time_));
     const std::uint64_t nodes = pool_.total_nodes();
     const std::uint64_t nps   = nodes * 1000ULL / static_cast<std::uint64_t>(ms);
+    const bool          c960  = pool_.root_.chess960();
+    const int           rn    = g_root_noise.load(std::memory_order_relaxed);
 
-    std::ostringstream ss;
-    ss << "info depth " << depth << " seldepth " << seldepth_ << " score ";
+    for (int i = 0; i < multipv_; ++i) {
+        const RootMove& rm       = root_moves_[static_cast<std::size_t>(i)];
+        const bool      use_prev = (rm.score == -VALUE_INFINITE);
+        if (depth == 1 && use_prev && i > 0) continue;
 
-    if (is_mate_score(score)) {
-        // UCI wants distance in moves; positive when we deliver the mate.
-        const int plies      = (score > 0) ? (VALUE_MATE - score) : (VALUE_MATE + score);
-        const int mate_moves = (score > 0) ? (plies + 1) / 2 : -((plies + 1) / 2);
-        ss << "mate " << mate_moves;
-    } else {
-        // Remove the played move's root-noise bonus so the reported score (the
-        // self-play training label) is the move's true eval, not the noisy one.
-        const int rn = g_root_noise.load(std::memory_order_relaxed);
-        const Value clean = (rn > 0) ? score - root_noise_offset(best_move_, rn) : score;
-        ss << "cp " << clean;
+        const Depth d = use_prev ? std::max<Depth>(1, depth - 1) : depth;
+        Value       v = use_prev ? rm.prev_score : rm.uci_score;
+        if (v == -VALUE_INFINITE) v = VALUE_ZERO;
+
+        std::ostringstream ss;
+        ss << "info depth " << d << " seldepth " << rm.seldepth << " multipv " << (i + 1) << " score ";
+
+        if (is_mate_score(v)) {
+            // UCI wants distance in moves; positive when we deliver the mate.
+            const int plies      = (v > 0) ? (VALUE_MATE - v) : (VALUE_MATE + v);
+            const int mate_moves = (v > 0) ? (plies + 1) / 2 : -((plies + 1) / 2);
+            ss << "mate " << mate_moves;
+        } else {
+            // Remove this line's root-noise bonus so the reported score (the self-play
+            // training label) is the move's true eval, not the noisy one.
+            const Value clean = (rn > 0) ? v - root_noise_offset(rm.move, rn) : v;
+            ss << "cp " << clean;
+        }
+
+        // Previous-iteration scores are exact whatever their flags say.
+        if (!use_prev) {
+            if (rm.inexact_lower)      ss << " lowerbound";
+            else if (rm.inexact_upper) ss << " upperbound";
+        }
+
+        ss << " nodes " << nodes << " nps " << nps << " time " << ms << " tbhits "
+           << syzygy::hits() << " hashfull " << pool_.tt_.hashfull();
+
+        const auto& pv  = use_prev ? rm.prev_pv : rm.pv;
+        const int   len = use_prev ? rm.prev_pv_len : rm.pv_len;
+        if (len > 0) {
+            ss << " pv";
+            for (int k = 0; k < len; ++k) ss << ' ' << chess::uci::moveToUci(pv[k], c960);
+        }
+
+        std::cout << ss.str() << std::endl;
     }
-
-    ss << " nodes " << nodes << " nps " << nps << " time " << ms << " tbhits "
-       << syzygy::hits() << " hashfull " << pool_.tt_.hashfull();
-
-    const std::string pv = pv_string();
-    if (!pv.empty()) ss << " pv " << pv;
-
-    std::cout << ss.str() << std::endl;
 }
 
 }  // namespace engine

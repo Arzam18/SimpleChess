@@ -1,0 +1,162 @@
+# Android (arm64) build of SimpleChess for UCI front-ends such as DroidFish.
+#
+# Cross-compiles with the Android NDK preinstalled on GitHub's Ubuntu runner image and links a
+# fully static position-independent executable, the form Android execs and a phone front-end
+# can run (no dynamic loader, no shared libc++ to find). The ELF is checked for exactly that.
+# The same objects are then linked once more as a plain static (non-PIE) executable purely to
+# RUN them: qemu-user cannot load a static-PIE built against Bionic (it faults before the first
+# syscall, on every qemu version tried), but it runs the plain static link, which differs from
+# the shipped file in nothing but the link mode. The run-test starts that binary with the
+# shipped net beside it and searches four positions to depth 12 at 1 thread; the node counts
+# are printed for comparison with a native build of the same source (they match when the
+# cross-compiled code is right).
+#
+# Two variants, because the int8 network layers have no NEON path without the Arm dot-product
+# extension (src/nnue.cpp is guarded on __ARM_FEATURE_DOTPROD and otherwise falls back to scalar):
+#   arm64          -march=armv8.2-a+dotprod   phone SoCs from ~2018 on (Cortex-A75/A55 and newer): the build to use
+#   arm64-generic  -march=armv8-a             older 64-bit SoCs; correct, but the int8 layers run scalar, much slower
+#
+# Runs on demand and on release tags. The output is a run ARTIFACT (tar.gz of binary + net +
+# install notes), deliberately never a release asset: releases stay source + net.
+name: Android build
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # qemu_cpu: a real phone core of each class for the run-test, so the dotprod build is
+        # proven on a core that has it and the generic build on one that does NOT (an
+        # instruction the target lacks would SIGILL here instead of on a user's device).
+        include:
+          - variant: arm64
+            march: armv8.2-a+dotprod
+            qemu_cpu: cortex-a76
+          - variant: arm64-generic
+            march: armv8-a
+            qemu_cpu: cortex-a53
+    steps:
+      - uses: actions/checkout@v7
+
+      # NDK 28 or newer: NDK 27's static executables carry a TLS segment Bionic rejects at
+      # startup ("TLS segment is underaligned"), so a build from it would not start on a phone.
+      - name: Locate the NDK cross-compiler
+        id: ndk
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          test -d "$NDK" || { echo "::error::no Android NDK on this runner (ANDROID_NDK_LATEST_HOME unset)"; exit 1; }
+          REV=$(grep '^Pkg.Revision' "$NDK/source.properties" | head -1 | awk '{print $NF}')
+          echo "NDK $REV at $NDK"
+          test "${REV%%.*}" -ge 28 || { echo "::error::NDK $REV is too old (need 28+)"; exit 1; }
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CXX="$BIN/aarch64-linux-android24-clang++"
+          test -x "$CXX" || { echo "::error::$CXX is missing"; ls "$BIN" | head -20; exit 1; }
+          "$CXX" --version | head -1
+          echo "cxx=$CXX" >> "$GITHUB_OUTPUT"
+          echo "strip=$BIN/llvm-strip" >> "$GITHUB_OUTPUT"
+          echo "ver=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      # The Makefile takes the compiler and the target from the command line (CXX, ARCH) and
+      # keeps its own optimisation set; EXTRA and LDFLAGS add only what Android needs. The
+      # desktop hash default (4 GB, zero-filled at startup) is lowered for a phone; the
+      # front-end sets Hash anyway. The second make relinks the SAME objects as a plain static
+      # executable for the run-test below (nothing is recompiled: same CXXFLAGS, only LDFLAGS).
+      - name: Build (-march=${{ matrix.march }})
+        run: |
+          set -euo pipefail
+          FLAGS=(CXX="${{ steps.ndk.outputs.cxx }}" ARCH="-march=${{ matrix.march }}" EXTRA="-fPIE -DSC_DEFAULT_HASH=64")
+          make -j"$(nproc)" "${FLAGS[@]}" LDFLAGS="-flto -pthread -static-pie" 2>&1 | tee build.log
+          grep -q -- "-march=${{ matrix.march }}" build.log || { echo "::error::target flag never reached a compile line"; exit 1; }
+          make -j"$(nproc)" "${FLAGS[@]}" LDFLAGS="-flto -pthread -static" EXE=simplechess-runtest 2>&1 | tee relink.log
+          if grep -q -- ' -c ' relink.log; then echo "::error::the run-test relink recompiled sources (flag mismatch)"; exit 1; fi
+
+      - name: Verify the ELFs, then strip the shipped one
+        run: |
+          set -euo pipefail
+          file simplechess simplechess-runtest
+          H=$(readelf -h simplechess)
+          echo "$H" | grep -q 'Machine:.*AArch64' || { echo "::error::not an AArch64 ELF"; exit 1; }
+          echo "$H" | grep -q 'Type:.*DYN'         || { echo "::error::not position-independent (Android refuses a non-PIE executable)"; exit 1; }
+          if readelf -d simplechess | grep -q NEEDED; then
+            echo "::error::binary has shared-library dependencies"; readelf -d simplechess; exit 1
+          fi
+          if readelf -l simplechess | grep -q INTERP; then
+            echo "::error::binary wants a dynamic loader (not static)"; exit 1
+          fi
+          R=$(readelf -h simplechess-runtest)
+          echo "$R" | grep -q 'Machine:.*AArch64' || { echo "::error::run-test binary is not AArch64"; exit 1; }
+          echo "$R" | grep -q 'Type:.*EXEC'        || { echo "::error::run-test binary is not a plain static executable"; exit 1; }
+          "${{ steps.ndk.outputs.strip }}" simplechess
+          ls -l simplechess simplechess-runtest
+
+      - name: Stage the archive (binary + net + install notes)
+        id: stage
+        run: |
+          set -euo pipefail
+          NAME="simplechess-${{ steps.ndk.outputs.ver }}-android-${{ matrix.variant }}"
+          mkdir -p "stage/$NAME"
+          cp simplechess "stage/$NAME/"
+          cp nets/SCNNUEv*.scn5 "stage/$NAME/"
+          cp tools/ci/android-readme.txt "stage/$NAME/README-ANDROID.txt"
+          tar -C stage -czf "$NAME.tar.gz" "$NAME"
+          ls -l "$NAME.tar.gz"
+          tar tzf "$NAME.tar.gz"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "dir=$PWD/stage/$NAME" >> "$GITHUB_OUTPUT"
+
+      # The run-test binary sits in a copy of the shipped layout (net beside it, same file
+      # name) so the engine's own net discovery is what gets exercised.
+      - name: Run the engine under qemu-user (${{ matrix.qemu_cpu }})
+        env:
+          QEMU_CPU: ${{ matrix.qemu_cpu }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static > /dev/null
+          qemu-aarch64-static --version | head -1
+          # Toolchain + emulator sanity first: a trivial program built and linked like the
+          # run-test binary must run, or a failure below says nothing about the engine.
+          printf '#include <cstdio>\n#include <filesystem>\nint main(int, char** argv){ std::printf("hello from %%s\\n", std::filesystem::canonical(argv[0]).c_str()); }\n' > hello.cpp
+          "${{ steps.ndk.outputs.cxx }}" -std=c++20 -O2 -fPIE -march=${{ matrix.march }} hello.cpp -o hello -pthread -static
+          qemu-aarch64-static ./hello
+          mkdir -p runtest
+          cp simplechess-runtest runtest/simplechess
+          cp "${{ steps.stage.outputs.dir }}"/*.scn5 runtest/
+          if ! python3 -u tools/ci/uci_smoke.py qemu-aarch64-static "$PWD/runtest/simplechess" --depth 12 --timeout 900; then
+            echo "== run-test failed; startup syscall trace:"
+            qemu-aarch64-static -strace "$PWD/runtest/simplechess" < /dev/null 2>&1 | tail -40 || true
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: ${{ steps.stage.outputs.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+      # Post-mortem only: a build that failed the run-test is kept a week for inspection
+      # (the shipped layout plus the unstripped run-test binary).
+      - if: failure() && steps.stage.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.stage.outputs.name }}-FAILED-runtest
+          path: |
+            ${{ steps.stage.outputs.dir }}
+            simplechess-runtest
+          retention-days: 7

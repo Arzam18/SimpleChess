@@ -4,6 +4,93 @@ Release history for SimpleChess. An entry is added here whenever a tested candid
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.3.0 — 2026-09-22
+
+- Self-reports: `SimpleChess 3.3.0`
+- Source VERSION at save time: `3.3.0`
+
+**At a glance** (full detail in the sections below):
+
+- `MultiPV` analysis mode.
+- 50-move rule: the static evaluation is damped toward the draw as the halfmove clock climbs, and a
+  cached mate the clock voids is no longer trusted.
+- Android arm64 build (fully static, for DroidFish and other phone front-ends) from the repository's
+  GitHub Actions workflow.
+- `Pass*` tuning knobs no longer advertised; `make clean` and header dependency tracking fixed for
+  source checkouts.
+
+### MultiPV
+
+`MultiPV` (spin, default 1, max 256): the engine reports the N best root moves, each with its own
+principal variation, as `info ... multipv I ...` lines. Each iteration runs one full root search
+per line: the line's move is searched first, the lines already found are excluded, and only the first
+line writes the root transposition-table entry, counts the time manager's effort shares and drives
+the adaptive width. Lines are kept in a stable descending sort; a line not reached in an aborted
+iteration is shown at depth-1 from its previous score, and a line cut off on an aspiration bound
+carries `lowerbound`/`upperbound`. The move played is the top line. The default is untouched: at
+`MultiPV 1` the search is node-identical and bestmove-identical to 3.2.0, and the only change to the
+info line is the standard ` multipv 1` token.
+
+### 50-move-rule eval damping
+
+The static evaluation is now scaled toward zero in proportion to the halfmove clock: a freshly
+computed net eval is damped by `eval -= eval * halfmove_clock / 199` before it drives pruning and
+before it enters the transposition table. A position shuffling toward the 50-move draw — no capture
+or pawn move for dozens of plies — therefore stops reporting a full advantage it can no longer force,
+and the search stops chasing a win that the draw counter is about to erase. The factor is roughly a
+half at clock 100 (the draw threshold) and reaches zero only at 199, which real play never sees. The
+damping is applied only to a freshly evaluated position, never to a value reused from the table (that
+value was already damped when it was written, so re-damping would compound on transpositions). Both
+static-eval sites — the main search and the quiescence stand-pat — are covered. A correctness change
+whose effect lives in the high-clock endgame tail.
+
+### 50-move-rule mate reclassification
+
+A mate score read back from the transposition table is now trusted only if the mating side can
+actually deliver it before the 50-move draw resets the game. When the reported distance to mate
+exceeds the plies the halfmove clock still allows, the mate is unreachable, so it is downgraded to a
+high but non-mate score: the search keeps treating the position as winning, but stops trusting,
+extending and reporting a forced mate the draw counter voids — the case where a mate found at a low
+clock is reused, via a transposition-table cutoff, at a higher one. A mate that is reachable within
+the clock budget is unaffected and still reported as a mate. The rule is confined to true mate scores;
+tablebase scores are never cached in the table, so they cannot reach this path. A correctness fix:
+the engine no longer chases a mate it cannot force; giving up a false-mate cutoff costs a few nodes,
+and the payoff is a long-time-control property.
+
+### Pass* tunables no longer advertised
+
+The eleven `Pass*` pass-eval tunables were development knobs, not user options; they are no longer
+listed in the `uci` option set (a tuning build sets `SC_PASS_UCI_OPTIONS=1` to re-expose them).
+`setoption` still accepts them, so match tooling that sets `PassX=...` keeps working. E6's defaults
+are compiled in and unchanged.
+
+### Android arm64 build (GitHub Actions)
+
+`.github/workflows/android.yml` cross-compiles the engine for 64-bit Android with the NDK, as a
+fully static position-independent executable (the form Android will exec and a phone front-end
+such as DroidFish can run), in two variants: `arm64` (`-march=armv8.2-a+dotprod`, the build for any
+phone SoC from about 2018 on) and `arm64-generic` (`-march=armv8-a`, for older SoCs; the int8 network
+layers have no NEON path without the dot-product extension and fall back to scalar code, so it is
+much slower but plays identically). Each run checks the ELF (AArch64, PIE, no dynamic loader, no
+shared-library dependencies), then links the same objects once more as a plain static executable and
+runs that under qemu-user — qemu cannot load a static-PIE built against Bionic, and the plain static
+link differs from the shipped file in nothing but the link mode — with the shipped net beside it,
+through `tools/ci/uci_smoke.py`: net discovery, then four positions searched to a fixed depth at
+1 thread, emulating a Cortex-A76 for the dotprod build and a Cortex-A53 for the generic one so an
+instruction the target lacks would fault in CI rather than on a phone. Both variants reproduce the
+native build's node counts exactly. Only then is `simplechess-<version>-android-<variant>.tar.gz`
+(stripped binary, network, `README-ANDROID.txt` install notes) uploaded as a run artifact. The
+workflow runs on every release tag and on demand, so the build for this release is under the
+repository's Actions tab. The phone build lowers the compiled-in Hash default from 4 GB to 64 MB (the
+table is zero-filled at startup; the front-end sets Hash anyway) and requires NDK 28 or newer (NDK
+27's static link is rejected by Bionic at startup). The idea, the DroidFish PIE/static requirement
+and the NDK build recipe come from Arzam18's fork (github.com/Arzam18/SimpleChess), whose workflow
+this replaces.
+
+The Makefile's `clean` and `version` targets and its header-dependency tracking were gated by
+accident on the dev-only `tools/release/version.py`, so a source-only checkout had no `make clean`
+and did not rebuild objects after a header edit. Both are now unconditional.
+
 ## v3.2.0 — 2026-09-16
 
 - Self-reports: `SimpleChess 3.2.0`
