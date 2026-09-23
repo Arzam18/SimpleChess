@@ -1,18 +1,16 @@
-# Android (arm64) build of SimpleChess with embedded NNUE net for UCI front-ends such as DroidFish.
+# Android (arm64) build of SimpleChess with an embedded NNUE network for UCI front-ends (e.g. DroidFish).
 #
-# Cross-compiles with the Android NDK preinstalled on GitHub's Ubuntu runner image and links a
-# fully static position-independent executable, the form Android execs and a phone front-end
-# can run (no dynamic loader, no shared libc++ to find). The ELF is checked for exactly that.
-# The same objects are then linked once more as a plain static (non-PIE) executable purely to
-# RUN them: qemu-user cannot load a static-PIE built against Bionic (it faults before the first
-# syscall, on every qemu version tried), but it runs the plain static link, which differs from
-# the shipped file in nothing but the link mode. Because the NNUE network is embedded directly
-# into the binary, no external net files are staged or needed during execution.
+# Cross-compiles with the Android NDK (r28+) on GitHub's Ubuntu runner image and links a
+# fully static position-independent executable (static-PIE).
 #
-# Two variants, because the int8 network layers have no NEON path without the Arm dot-product
-# extension (src/nnue.cpp is guarded on __ARM_FEATURE_DOTPROD and otherwise falls back to scalar):
-#   arm64          -march=armv8.2-a+dotprod   phone SoCs from ~2018 on (Cortex-A75/A55 and newer): the build to use
-#   arm64-generic  -march=armv8-a             older 64-bit SoCs; correct, but the int8 layers run scalar, much slower
+# A second plain-static link is created solely for QEMU user-mode verification, as qemu-user
+# cannot load Bionic static-PIE binaries. Because the NNUE network is embedded directly into
+# the executable, Git LFS is enabled during checkout (`lfs: true`) to ensure the full net file
+# is available to the compiler/linker.
+#
+# Two variants:
+#   arm64          -march=armv8.2-a+dotprod   modern SoCs (~2018+): hardware dot-product acceleration
+#   arm64-generic  -march=armv8-a             older 64-bit SoCs: scalar fallback path
 #
 # Runs on demand and on release tags. The output is a run ARTIFACT (tar.gz of binary + install notes).
 
@@ -37,9 +35,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # qemu_cpu: a real phone core of each class for the run-test, so the dotprod build is
-        # proven on a core that has it and the generic build on one that does NOT (an
-        # instruction the target lacks would SIGILL here instead of on a user's device).
+        # qemu_cpu: a real phone core class for the run-test, proving dotprod on supported cores
+        # and fallback logic on generic cores.
         include:
           - variant: arm64
             march: armv8.2-a+dotprod
@@ -49,29 +46,31 @@ jobs:
             qemu_cpu: cortex-a53
 
     steps:
-      - uses: actions/checkout@v4
+      # lfs: true is required so Git LFS pulls the raw NNUE binary weights rather than text pointer files
+      - name: Checkout repository with Git LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
 
-      # NDK 28 or newer: NDK 27's static executables carry a TLS segment Bionic rejects at
-      # startup ("TLS segment is underaligned"), so a build from it would not start on a phone.
+      # NDK 28 or newer: NDK 27's static executables carry a TLS segment Bionic rejects at startup.
       - name: Locate the NDK cross-compiler
         id: ndk
         run: |
           set -euo pipefail
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
           test -d "$NDK" || { echo "::error::no Android NDK on this runner (ANDROID_NDK_LATEST_HOME unset)"; exit 1; }
-          REV=$(grep '^Pkg.Revision' "$NDK/source.properties" | head -1 | awk '{print $NF}')
-          echo "NDK $REV at $NDK"
-          test "${REV%%.*}" -ge 28 || { echo "::error::NDK $REV is too old (need 28+)"; exit 1; }
+          REV=$(grep '^Pkg.Revision' "$NDK/source.properties" \vert{} head -1 \vert{} awk '{print $NF}')
+          echo "NDK $REV at$NDK"
+          test "${REV\%\%.*}" -ge 28 \vert{}\vert{} { echo "::error::NDK $REV is too old (need 28+)"; exit 1; }
           BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           CXX="$BIN/aarch64-linux-android24-clang++"
-          test -x "$CXX" || { echo "::error::$CXX is missing"; ls "$BIN" | head -20; exit 1; }
+          test -x "$CXX" \vert{}\vert{} { echo "::error::$CXX is missing"; ls "$BIN" | head -20; exit 1; }
           "$CXX" --version | head -1
           echo "cxx=$CXX" >> "$GITHUB_OUTPUT"
           echo "strip=$BIN/llvm-strip" >> "$GITHUB_OUTPUT"
-          echo "ver=$(cat VERSION 2>/dev/null || echo "1.0.0")" >> "$GITHUB_OUTPUT"
+          echo "ver=$(cat VERSION 2>/dev/null \vert{}\vert{} echo "1.0.0")" >> "$GITHUB_OUTPUT"
 
-      # The Makefile takes the compiler and the target from the command line (CXX, ARCH) and
-      # keeps its own optimisation set; EXTRA and LDFLAGS add only what Android needs.
+      # Compile production static-PIE and relink plain static binary for QEMU testing
       - name: Build (-march=${{ matrix.march }})
         run: |
           set -euo pipefail
@@ -98,7 +97,7 @@ jobs:
           echo "$R" | grep -q 'Machine:.*AArch64' || { echo "::error::run-test binary is not AArch64"; exit 1; }
           echo "$R" | grep -q 'Type:.*EXEC'        || { echo "::error::run-test binary is not a plain static executable"; exit 1; }
           "${{ steps.ndk.outputs.strip }}" simplechess
-          ls -l simplechess simplechess-runtest
+          ls -lh simplechess simplechess-runtest
 
       - name: Stage the archive (binary + install notes)
         id: stage
@@ -111,12 +110,12 @@ jobs:
             cp tools/ci/android-readme.txt "stage/$NAME/README-ANDROID.txt"
           fi
           tar -C stage -czf "$NAME.tar.gz" "$NAME"
-          ls -l "$NAME.tar.gz"
+          ls -lh "$NAME.tar.gz"
           tar tzf "$NAME.tar.gz"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "dir=$PWD/stage/$NAME" >> "$GITHUB_OUTPUT"
 
-      # The run-test binary exercises embedded net loading during search.
+      # Run test under QEMU user emulation
       - name: Run the engine under qemu-user (${{ matrix.qemu_cpu }})
         env:
           QEMU_CPU: ${{ matrix.qemu_cpu }}
@@ -126,7 +125,7 @@ jobs:
           sudo apt-get install -y -qq qemu-user-static > /dev/null
           qemu-aarch64-static --version | head -1
           
-          # Toolchain + emulator sanity check
+          # Toolchain + emulator sanity first
           printf '#include <cstdio>\n#include <filesystem>\nint main(int, char** argv){ std::printf("hello from %%s\\n", std::filesystem::canonical(argv[0]).c_str()); }\n' > hello.cpp
           "${{ steps.ndk.outputs.cxx }}" -std=c++20 -O2 -fPIE -march=${{ matrix.march }} hello.cpp -o hello -pthread -static
           qemu-aarch64-static ./hello
@@ -146,7 +145,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      # Post-mortem artifact preserved on run failure
+      # Post-mortem only: failure artifacts preserved for inspection
       - if: failure() && steps.stage.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
