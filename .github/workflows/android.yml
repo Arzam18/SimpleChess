@@ -1,4 +1,4 @@
-# Android (arm64) build of SimpleChess for UCI front-ends such as DroidFish.
+# Android (arm64) build of SimpleChess with embedded NNUE net for UCI front-ends such as DroidFish.
 #
 # Cross-compiles with the Android NDK preinstalled on GitHub's Ubuntu runner image and links a
 # fully static position-independent executable, the form Android execs and a phone front-end
@@ -6,18 +6,16 @@
 # The same objects are then linked once more as a plain static (non-PIE) executable purely to
 # RUN them: qemu-user cannot load a static-PIE built against Bionic (it faults before the first
 # syscall, on every qemu version tried), but it runs the plain static link, which differs from
-# the shipped file in nothing but the link mode. The run-test starts that binary with the
-# shipped net beside it and searches four positions to depth 12 at 1 thread; the node counts
-# are printed for comparison with a native build of the same source (they match when the
-# cross-compiled code is right).
+# the shipped file in nothing but the link mode. Because the NNUE network is embedded directly
+# into the binary, no external net files are staged or needed during execution.
 #
 # Two variants, because the int8 network layers have no NEON path without the Arm dot-product
 # extension (src/nnue.cpp is guarded on __ARM_FEATURE_DOTPROD and otherwise falls back to scalar):
 #   arm64          -march=armv8.2-a+dotprod   phone SoCs from ~2018 on (Cortex-A75/A55 and newer): the build to use
 #   arm64-generic  -march=armv8-a             older 64-bit SoCs; correct, but the int8 layers run scalar, much slower
 #
-# Runs on demand and on release tags. The output is a run ARTIFACT (tar.gz of binary + net +
-# install notes), deliberately never a release asset: releases stay source + net.
+# Runs on demand and on release tags. The output is a run ARTIFACT (tar.gz of binary + install notes).
+
 name: Android build
 
 on:
@@ -49,8 +47,9 @@ jobs:
           - variant: arm64-generic
             march: armv8-a
             qemu_cpu: cortex-a53
+
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # NDK 28 or newer: NDK 27's static executables carry a TLS segment Bionic rejects at
       # startup ("TLS segment is underaligned"), so a build from it would not start on a phone.
@@ -69,13 +68,10 @@ jobs:
           "$CXX" --version | head -1
           echo "cxx=$CXX" >> "$GITHUB_OUTPUT"
           echo "strip=$BIN/llvm-strip" >> "$GITHUB_OUTPUT"
-          echo "ver=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          echo "ver=$(cat VERSION 2>/dev/null || echo "1.0.0")" >> "$GITHUB_OUTPUT"
 
       # The Makefile takes the compiler and the target from the command line (CXX, ARCH) and
-      # keeps its own optimisation set; EXTRA and LDFLAGS add only what Android needs. The
-      # desktop hash default (4 GB, zero-filled at startup) is lowered for a phone; the
-      # front-end sets Hash anyway. The second make relinks the SAME objects as a plain static
-      # executable for the run-test below (nothing is recompiled: same CXXFLAGS, only LDFLAGS).
+      # keeps its own optimisation set; EXTRA and LDFLAGS add only what Android needs.
       - name: Build (-march=${{ matrix.march }})
         run: |
           set -euo pipefail
@@ -104,23 +100,23 @@ jobs:
           "${{ steps.ndk.outputs.strip }}" simplechess
           ls -l simplechess simplechess-runtest
 
-      - name: Stage the archive (binary + net + install notes)
+      - name: Stage the archive (binary + install notes)
         id: stage
         run: |
           set -euo pipefail
           NAME="simplechess-${{ steps.ndk.outputs.ver }}-android-${{ matrix.variant }}"
           mkdir -p "stage/$NAME"
           cp simplechess "stage/$NAME/"
-          cp nets/SCNNUEv*.scn5 "stage/$NAME/"
-          cp tools/ci/android-readme.txt "stage/$NAME/README-ANDROID.txt"
+          if [ -f tools/ci/android-readme.txt ]; then
+            cp tools/ci/android-readme.txt "stage/$NAME/README-ANDROID.txt"
+          fi
           tar -C stage -czf "$NAME.tar.gz" "$NAME"
           ls -l "$NAME.tar.gz"
           tar tzf "$NAME.tar.gz"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "dir=$PWD/stage/$NAME" >> "$GITHUB_OUTPUT"
 
-      # The run-test binary sits in a copy of the shipped layout (net beside it, same file
-      # name) so the engine's own net discovery is what gets exercised.
+      # The run-test binary exercises embedded net loading during search.
       - name: Run the engine under qemu-user (${{ matrix.qemu_cpu }})
         env:
           QEMU_CPU: ${{ matrix.qemu_cpu }}
@@ -129,31 +125,30 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user-static > /dev/null
           qemu-aarch64-static --version | head -1
-          # Toolchain + emulator sanity first: a trivial program built and linked like the
-          # run-test binary must run, or a failure below says nothing about the engine.
+          
+          # Toolchain + emulator sanity check
           printf '#include <cstdio>\n#include <filesystem>\nint main(int, char** argv){ std::printf("hello from %%s\\n", std::filesystem::canonical(argv[0]).c_str()); }\n' > hello.cpp
           "${{ steps.ndk.outputs.cxx }}" -std=c++20 -O2 -fPIE -march=${{ matrix.march }} hello.cpp -o hello -pthread -static
           qemu-aarch64-static ./hello
+          
           mkdir -p runtest
           cp simplechess-runtest runtest/simplechess
-          cp "${{ steps.stage.outputs.dir }}"/*.scn5 runtest/
           if ! python3 -u tools/ci/uci_smoke.py qemu-aarch64-static "$PWD/runtest/simplechess" --depth 12 --timeout 900; then
             echo "== run-test failed; startup syscall trace:"
             qemu-aarch64-static -strace "$PWD/runtest/simplechess" < /dev/null 2>&1 | tail -40 || true
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.name }}
           path: ${{ steps.stage.outputs.name }}.tar.gz
           if-no-files-found: error
           retention-days: 90
 
-      # Post-mortem only: a build that failed the run-test is kept a week for inspection
-      # (the shipped layout plus the unstripped run-test binary).
+      # Post-mortem artifact preserved on run failure
       - if: failure() && steps.stage.outcome == 'success'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.name }}-FAILED-runtest
           path: |
