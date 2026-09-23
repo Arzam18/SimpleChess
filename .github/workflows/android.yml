@@ -46,7 +46,7 @@ jobs:
             qemu_cpu: cortex-a53
 
     steps:
-      # lfs: true is required so Git LFS pulls the raw NNUE binary weights rather than text pointer files
+      # lfs: true pulls the raw binary NNUE weights rather than text pointers
       - name: Checkout repository with Git LFS
         uses: actions/checkout@v4
         with:
